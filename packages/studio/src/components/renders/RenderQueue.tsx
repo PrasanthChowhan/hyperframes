@@ -2,6 +2,11 @@ import { memo, useState, useRef, useEffect } from "react";
 import { RenderQueueItem } from "./RenderQueueItem";
 import type { RenderJob, ResolutionPreset } from "./useRenderQueue";
 
+export interface CompositionDimensions {
+  width: number;
+  height: number;
+}
+
 interface RenderQueueProps {
   jobs: RenderJob[];
   projectId: string;
@@ -13,37 +18,71 @@ interface RenderQueueProps {
     resolution: ResolutionPreset | "auto",
   ) => void;
   isRendering: boolean;
+  /**
+   * Authored dimensions of the active composition, used to derive
+   * landscape vs portrait when the user picks a 1080p or 4K scale.
+   * `null` falls back to landscape (legacy default).
+   */
+  compositionDimensions?: CompositionDimensions | null;
 }
 
-// Indexing the table by `ResolutionPreset | "auto"` makes adding a new preset
-// to `core.types` (e.g. an 8K row) a TypeScript error here instead of a
-// silently missing dropdown entry. Order is fixed by the array below.
-const RESOLUTION_LABELS: Record<ResolutionPreset | "auto", { label: string; title: string }> = {
-  auto: { label: "Auto", title: "Render at the composition's authored resolution" },
-  landscape: { label: "1080p ↔", title: "1920×1080 landscape" },
-  portrait: { label: "1080p ↕", title: "1080×1920 portrait" },
-  "landscape-4k": {
-    label: "4K ↔",
-    title: "3840×2160 — supersamples a 1080p composition via Chrome DPR. Slower, larger files.",
-  },
-  "portrait-4k": {
-    label: "4K ↕",
-    title: "2160×3840 — supersamples a 1080p portrait composition via Chrome DPR.",
-  },
-};
+// User-facing render scale. Orientation is derived from the composition's
+// authored aspect ratio at render time, so the user never picks an
+// orientation that mismatches their comp.
+type RenderScale = "auto" | "1080p" | "4k";
 
-const RESOLUTION_OPTION_ORDER: (ResolutionPreset | "auto")[] = [
-  "auto",
-  "landscape",
-  "portrait",
-  "landscape-4k",
-  "portrait-4k",
-];
+const SCALE_OPTION_ORDER: RenderScale[] = ["auto", "1080p", "4k"];
 
-const RESOLUTION_OPTIONS = RESOLUTION_OPTION_ORDER.map((value) => ({
-  value,
-  ...RESOLUTION_LABELS[value],
-}));
+function isPortraitComp(dims: CompositionDimensions | null | undefined): boolean {
+  // Squares and missing dims fall through to landscape — matches the legacy
+  // default ("landscape" was the first preset). The auto option exists for
+  // users who want exact authored dimensions.
+  return dims != null && dims.height > dims.width;
+}
+
+function resolveResolution(
+  scale: RenderScale,
+  dims: CompositionDimensions | null | undefined,
+): ResolutionPreset | "auto" {
+  if (scale === "auto") return "auto";
+  const portrait = isPortraitComp(dims);
+  if (scale === "1080p") return portrait ? "portrait" : "landscape";
+  return portrait ? "portrait-4k" : "landscape-4k";
+}
+
+function scaleLabel(scale: RenderScale): string {
+  if (scale === "auto") return "Auto";
+  if (scale === "1080p") return "1080p";
+  return "4K";
+}
+
+// Resolved output dimensions for a given scale + composition. Mirrors
+// `CANVAS_DIMENSIONS` in core for the 1080p / 4K presets; `auto` echoes the
+// composition's authored dims so the user can see exactly what they'll get.
+function resolvedDimensions(
+  scale: RenderScale,
+  dims: CompositionDimensions | null | undefined,
+): CompositionDimensions | null {
+  if (scale === "auto") return dims ?? null;
+  const portrait = isPortraitComp(dims);
+  if (scale === "1080p") {
+    return portrait ? { width: 1080, height: 1920 } : { width: 1920, height: 1080 };
+  }
+  return portrait ? { width: 2160, height: 3840 } : { width: 3840, height: 2160 };
+}
+
+function formatDims(dims: CompositionDimensions | null): string {
+  if (!dims) return "?";
+  return `${dims.width}×${dims.height}`;
+}
+
+function scaleOptionLabel(
+  scale: RenderScale,
+  dims: CompositionDimensions | null | undefined,
+): string {
+  const resolved = resolvedDimensions(scale, dims);
+  return resolved ? `${scaleLabel(scale)} · ${formatDims(resolved)}` : scaleLabel(scale);
+}
 
 const FORMAT_INFO: Record<"mp4" | "webm" | "mov", { label: string; desc: string }> = {
   mp4: { label: "MP4", desc: "Best for general use. Smallest file, universal playback." },
@@ -124,6 +163,7 @@ const QUALITY_OPTIONS: {
 function FormatExportButton({
   onStartRender,
   isRendering,
+  compositionDimensions,
 }: {
   onStartRender: (
     format: "mp4" | "webm" | "mov",
@@ -131,10 +171,11 @@ function FormatExportButton({
     resolution: ResolutionPreset | "auto",
   ) => void;
   isRendering: boolean;
+  compositionDimensions?: CompositionDimensions | null;
 }) {
   const [format, setFormat] = useState<"mp4" | "webm" | "mov">("mp4");
   const [quality, setQuality] = useState<"draft" | "standard" | "high">("standard");
-  const [resolution, setResolution] = useState<ResolutionPreset | "auto">("auto");
+  const [scale, setScale] = useState<RenderScale>("auto");
 
   // MOV (ProRes) is a fixed-quality codec — quality selector has no effect.
   const showQuality = format !== "mov";
@@ -147,15 +188,14 @@ function FormatExportButton({
           (feature-flag, etc.), move `rounded-l` to whichever element ends up
           leftmost. */}
       <select
-        value={resolution}
-        onChange={(e) => setResolution(e.target.value as ResolutionPreset | "auto")}
+        value={scale}
+        onChange={(e) => setScale(e.target.value as RenderScale)}
         disabled={isRendering}
-        title={RESOLUTION_OPTIONS.find((r) => r.value === resolution)?.title}
         className="h-5 px-1 text-[10px] rounded-l bg-neutral-800 border border-neutral-700 text-neutral-300 outline-none disabled:opacity-50"
       >
-        {RESOLUTION_OPTIONS.map((r) => (
-          <option key={r.value} value={r.value} title={r.title}>
-            {r.label}
+        {SCALE_OPTION_ORDER.map((value) => (
+          <option key={value} value={value}>
+            {scaleOptionLabel(value, compositionDimensions)}
           </option>
         ))}
       </select>
@@ -185,7 +225,9 @@ function FormatExportButton({
         <option value="webm">WebM</option>
       </select>
       <button
-        onClick={() => onStartRender(format, quality, resolution)}
+        onClick={() =>
+          onStartRender(format, quality, resolveResolution(scale, compositionDimensions))
+        }
         disabled={isRendering}
         className="flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold rounded-r bg-studio-accent text-[#09090B] hover:brightness-110 transition-colors disabled:opacity-50"
       >
@@ -202,6 +244,7 @@ export const RenderQueue = memo(function RenderQueue({
   onClearCompleted,
   onStartRender,
   isRendering,
+  compositionDimensions,
 }: RenderQueueProps) {
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -228,7 +271,11 @@ export const RenderQueue = memo(function RenderQueue({
               Clear
             </button>
           )}
-          <FormatExportButton onStartRender={onStartRender} isRendering={isRendering} />
+          <FormatExportButton
+            onStartRender={onStartRender}
+            isRendering={isRendering}
+            compositionDimensions={compositionDimensions}
+          />
         </div>
       </div>
 

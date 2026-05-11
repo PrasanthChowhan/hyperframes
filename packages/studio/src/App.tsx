@@ -276,6 +276,42 @@ export function StudioApp() {
       setRightCollapsed(!captionHasSelection);
     }
   }, [captionHasSelection, captionEditMode]);
+
+  // Track the active composition's authored dimensions so the render
+  // dropdown can derive landscape vs portrait without asking the user.
+  // The runtime fires "state"/"timeline" messages after compositions load.
+  const [compositionDimensions, setCompositionDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  useMountEffect(() => {
+    const readDimensions = () => {
+      const iframe = previewIframeRef.current;
+      let doc: Document | null = null;
+      try {
+        doc = iframe?.contentDocument ?? null;
+      } catch {
+        return;
+      }
+      if (!doc) return;
+      const root = doc.querySelector("[data-composition-id]");
+      const w = parseInt(root?.getAttribute("data-width") ?? "", 10);
+      const h = parseInt(root?.getAttribute("data-height") ?? "", 10);
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+      setCompositionDimensions((prev) =>
+        prev && prev.width === w && prev.height === h ? prev : { width: w, height: h },
+      );
+    };
+    const handleMessage = (e: MessageEvent) => {
+      const data = e.data;
+      if (data?.source === "hf-preview" && (data?.type === "state" || data?.type === "timeline")) {
+        readDimensions();
+      }
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  });
+
   const [globalDragOver, setGlobalDragOver] = useState(false);
   const [appToast, setAppToast] = useState<AppToast | null>(null);
   const [timelineVisible, setTimelineVisible] = useState(true);
@@ -1687,6 +1723,7 @@ export function StudioApp() {
                   onStartRender={(format, quality, resolution) =>
                     renderQueue.startRender({ format, quality, resolution })
                   }
+                  compositionDimensions={compositionDimensions}
                   isRendering={renderQueue.isRendering}
                 />
               )}
