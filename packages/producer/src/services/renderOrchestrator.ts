@@ -536,17 +536,24 @@ export function buildMissingFrameRetryBatches(
   maxWorkers: number,
   workDir: string,
   attempt: number,
+  rangeStart: number = 0,
 ): WorkerTask[][] {
   const workersPerBatch = Math.max(1, Math.floor(maxWorkers));
   const batches: WorkerTask[][] = [];
 
+  // `ranges` are 0-indexed within the chunk's frame range (or full timeline
+  // when `rangeStart === 0`); translate to absolute composition indices so
+  // `WorkerTask`'s per-frame time math lands on the page's actual virtual
+  // clock, and propagate `outputFrameOffset` so the retry captures back at
+  // the same local file name `findMissingFrameRanges` was looking for.
   for (let i = 0; i < ranges.length; i += workersPerBatch) {
     const batchIndex = batches.length;
     const batch = ranges.slice(i, i + workersPerBatch).map((range, workerId) => ({
       workerId,
-      startFrame: range.startFrame,
-      endFrame: range.endFrame,
+      startFrame: rangeStart + range.startFrame,
+      endFrame: rangeStart + range.endFrame,
       outputDir: join(workDir, `retry-${attempt}-batch-${batchIndex}-worker-${workerId}`),
+      outputFrameOffset: rangeStart,
     }));
     batches.push(batch);
   }
@@ -605,11 +612,18 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
   onProgress?: (progress: ParallelProgress) => void;
   cfg: EngineConfig;
   log: ProducerLogger;
+  /**
+   * Forwarded to each `WorkerTask`'s `outputFrameOffset` and to the
+   * `buildMissingFrameRetryBatches` translation. Default 0 (in-process
+   * contract: `[0, totalFrames)`). See `WorkerTask.outputFrameOffset`.
+   */
+  frameRangeStart?: number;
 }): Promise<CaptureAttemptSummary[]> {
   const attempts: CaptureAttemptSummary[] = [];
   let currentWorkers = options.initialWorkerCount;
   let missingRanges: FrameRange[] | null = null;
   let attempt = 0;
+  const rangeStart = options.frameRangeStart ?? 0;
 
   while (true) {
     const frameCount = missingRanges ? countFrameRanges(missingRanges) : options.totalFrames;
@@ -622,8 +636,14 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
 
     const attemptWorkDir = join(options.workDir, `capture-attempt-${attempt}`);
     const batches = missingRanges
-      ? buildMissingFrameRetryBatches(missingRanges, currentWorkers, attemptWorkDir, attempt)
-      : [distributeFrames(options.totalFrames, currentWorkers, attemptWorkDir)];
+      ? buildMissingFrameRetryBatches(
+          missingRanges,
+          currentWorkers,
+          attemptWorkDir,
+          attempt,
+          rangeStart,
+        )
+      : [distributeFrames(options.totalFrames, currentWorkers, attemptWorkDir, rangeStart)];
 
     try {
       for (const tasks of batches) {

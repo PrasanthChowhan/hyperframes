@@ -29,6 +29,15 @@ export interface WorkerTask {
   startFrame: number;
   endFrame: number;
   outputDir: string;
+  /**
+   * Offset subtracted from the absolute frame index when naming the captured
+   * file (`frame_<i - outputFrameOffset>.{ext}`). Default 0. Distributed
+   * chunks set this to the chunk's absolute startFrame so file names land
+   * 0-indexed within the chunk's range — the encoder reads frames
+   * sequentially without an `-start_number` override. The per-frame TIME
+   * calculation still uses the absolute frame index.
+   */
+  outputFrameOffset?: number;
 }
 
 export interface WorkerResult {
@@ -148,20 +157,22 @@ export function distributeFrames(
   totalFrames: number,
   workerCount: number,
   workDir: string,
+  rangeStart: number = 0,
 ): WorkerTask[] {
   const tasks: WorkerTask[] = [];
   const framesPerWorker = Math.ceil(totalFrames / workerCount);
 
   for (let i = 0; i < workerCount; i++) {
-    const startFrame = i * framesPerWorker;
-    const endFrame = Math.min((i + 1) * framesPerWorker, totalFrames);
-    if (startFrame >= totalFrames) break;
+    const startFrame = rangeStart + i * framesPerWorker;
+    const endFrame = Math.min(rangeStart + (i + 1) * framesPerWorker, rangeStart + totalFrames);
+    if (startFrame >= rangeStart + totalFrames) break;
 
     tasks.push({
       workerId: i,
       startFrame,
       endFrame,
       outputDir: join(workDir, `worker-${i}`),
+      outputFrameOffset: rangeStart,
     });
   }
 
@@ -196,6 +207,7 @@ async function executeWorkerTask(
     );
     await initializeSession(session);
 
+    const outputOffset = task.outputFrameOffset ?? 0;
     for (let i = task.startFrame; i < task.endFrame; i++) {
       if (signal?.aborted) {
         throw new Error("Parallel worker cancelled");
@@ -204,14 +216,16 @@ async function executeWorkerTask(
       // frame-index → time math. The 1-in-1001 ULP loss for NTSC is invisible
       // at our scales (frame count tops out at single-digit thousands).
       const time = (i * captureOptions.fps.den) / captureOptions.fps.num;
+      const fileFrameIdx = i - outputOffset;
 
       if (onFrameBuffer) {
-        // Streaming mode: capture to buffer and invoke callback
-        const { buffer } = await captureFrameToBuffer(session, i, time);
+        // The streaming-encode callback receives the absolute index `i`
+        // (not `fileFrameIdx`) so the encoder sequences frames against the
+        // composition's timeline.
+        const { buffer } = await captureFrameToBuffer(session, fileFrameIdx, time);
         await onFrameBuffer(i, buffer);
       } else {
-        // Disk mode: capture to file
-        await captureFrame(session, i, time);
+        await captureFrame(session, fileFrameIdx, time);
       }
       framesCaptured++;
 

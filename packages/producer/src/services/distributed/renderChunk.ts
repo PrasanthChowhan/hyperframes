@@ -42,6 +42,7 @@ import {
   assertSwiftShader,
   type BeforeCaptureHook,
   BROWSER_GPU_NOT_SOFTWARE,
+  calculateOptimalWorkers,
   type CaptureOptions,
   type CaptureSession,
   closeCaptureSession,
@@ -531,7 +532,13 @@ export async function renderChunk(
       // would deadlock Chrome's compositor by issuing a second beginFrame
       // at a `frameTimeTicks` it had just advanced to.
 
-      // ── Capture the chunk's range via runCaptureStage ──
+      // Capture-cost calibration based on shader transitions /
+      // renderModeHints is not threaded through to chunks yet; the in-process
+      // renderer's `resolveRenderWorkerCount` wraps this with that reduction,
+      // but `PlanJson` doesn't carry the compiled hints needed to call it
+      // directly. The existing adaptive-retry path reduces workers if
+      // compositor contention surfaces as CDP timeouts.
+      const chunkWorkerCount = calculateOptimalWorkers(framesInChunk, undefined, cfg);
       await runCaptureStage({
         fileServer,
         workDir,
@@ -541,11 +548,10 @@ export async function renderChunk(
         cfg,
         forceScreenshot: encoder.forceScreenshot,
         log,
-        workerCount: 1,
-        // Pass the pre-warmed session through as `probeSession` so captureStage
-        // reuses it via `prepareCaptureSessionForReuse` instead of spinning up
-        // a fresh browser. The stage closes the session in its `finally`,
-        // so we MUST clear our own reference here to avoid a double-close.
+        workerCount: chunkWorkerCount,
+        // The parallel branch closes this session and spins up its own
+        // worker sessions, wasting the ~3-5s of pre-warmed setup. Worth a
+        // follow-up to skip pre-warmup when the resolved workerCount > 1.
         probeSession: session,
         needsAlpha: plan.dimensions.format !== "mp4",
         captureAttempts: [],
