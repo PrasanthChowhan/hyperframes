@@ -114,12 +114,6 @@ export function resolveTimelineMove(
   };
 }
 
-export function buildTrackZIndexMap(tracks: number[]): Map<number, number> {
-  const uniqueTracks = Array.from(new Set(tracks)).sort((a, b) => a - b);
-  const maxZIndex = uniqueTracks.length;
-  return new Map(uniqueTracks.map((track, index) => [track, maxZIndex - index]));
-}
-
 export function resolveTimelineResize(
   input: TimelineResizeInput,
   edge: "start" | "end",

@@ -4,7 +4,6 @@ import {
   buildPromptCopyText,
   buildTimelineElementAgentPrompt,
   buildTimelineAgentPrompt,
-  buildTrackZIndexMap,
   canOffsetTrimClipStart,
   getTimelineEditCapabilities,
   hasPatchableTimelineTarget,
@@ -156,29 +155,6 @@ describe("resolveTimelineMove", () => {
         200,
       ),
     ).toEqual({ start: 2, track: 2 });
-  });
-});
-
-describe("buildTrackZIndexMap", () => {
-  it("maps visually higher tracks onto higher z-index values", () => {
-    expect(buildTrackZIndexMap([-2, -1, 0, 3])).toEqual(
-      new Map([
-        [-2, 4],
-        [-1, 3],
-        [0, 2],
-        [3, 1],
-      ]),
-    );
-  });
-
-  it("deduplicates tracks before assigning z-index values", () => {
-    expect(buildTrackZIndexMap([-1, 0, -1, 3, 3])).toEqual(
-      new Map([
-        [-1, 3],
-        [0, 2],
-        [3, 1],
-      ]),
-    );
   });
 });
 

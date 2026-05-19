@@ -2,10 +2,7 @@ import { useCallback, useRef } from "react";
 import type { TimelineElement } from "../player";
 import { usePlayerStore } from "../player";
 import { applyPatchByTarget, readAttributeByTarget } from "../utils/sourcePatcher";
-import {
-  buildTrackZIndexMap,
-  formatTimelineAttributeNumber,
-} from "../player/components/timelineEditing";
+import { formatTimelineAttributeNumber } from "../player/components/timelineEditing";
 import {
   buildTimelineAssetId,
   buildTimelineAssetInsertHtml,
@@ -101,16 +98,6 @@ export function useTimelineEditing({
         throw new Error(`Timeline element ${element.id} is missing a patchable target`);
       }
 
-      const resolvedTargetPath = targetPath || "index.html";
-      const relevantElements = timelineElements
-        .map((te) =>
-          (te.key ?? te.id) === (element.key ?? element.id)
-            ? { ...te, start: updates.start, track: updates.track }
-            : te,
-        )
-        .filter((te) => (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath);
-      const trackZIndices = buildTrackZIndexMap(relevantElements.map((te) => te.track));
-
       let patchedContent = applyPatchByTarget(originalContent, patchTarget, {
         type: "attribute",
         property: "start",
@@ -121,17 +108,6 @@ export function useTimelineEditing({
         property: "track-index",
         value: String(updates.track),
       });
-      for (const te of relevantElements) {
-        const elementTarget = buildPatchTarget(te);
-        if (!elementTarget) continue;
-        const nextZIndex = trackZIndices.get(te.track);
-        if (nextZIndex == null) continue;
-        patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-          type: "inline-style",
-          property: "z-index",
-          value: String(nextZIndex),
-        });
-      }
 
       if (patchedContent === originalContent) {
         throw new Error(`Unable to patch timeline element ${element.id} in ${targetPath}`);
@@ -150,14 +126,7 @@ export function useTimelineEditing({
 
       reloadPreview();
     },
-    [
-      activeCompPath,
-      recordEdit,
-      timelineElements,
-      writeProjectFile,
-      domEditSaveTimestampRef,
-      reloadPreview,
-    ],
+    [activeCompPath, recordEdit, writeProjectFile, domEditSaveTimestampRef, reloadPreview],
   );
 
   const handleTimelineElementResize = useCallback(
@@ -247,14 +216,6 @@ export function useTimelineEditing({
           throw new Error(`Timeline element ${element.id} is missing a patchable target`);
         }
 
-        const resolvedTargetPath = targetPath || "index.html";
-        const remainingElements = timelineElements.filter(
-          (te) =>
-            (te.key ?? te.id) !== (element.key ?? element.id) &&
-            (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath,
-        );
-        const trackZIndices = buildTrackZIndexMap(remainingElements.map((te) => te.track));
-
         const removeResponse = await fetch(
           `/api/projects/${pid}/file-mutations/remove-element/${encodeURIComponent(targetPath)}`,
           {
@@ -271,19 +232,8 @@ export function useTimelineEditing({
           changed?: boolean;
           content?: string;
         };
-        let patchedContent =
+        const patchedContent =
           typeof removeData.content === "string" ? removeData.content : originalContent;
-        for (const te of remainingElements) {
-          const elementTarget = buildPatchTarget(te);
-          if (!elementTarget) continue;
-          const nextZIndex = trackZIndices.get(te.track);
-          if (nextZIndex == null) continue;
-          patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-            type: "inline-style",
-            property: "z-index",
-            value: String(nextZIndex),
-          });
-        }
 
         domEditSaveTimestampRef.current = Date.now();
         await saveProjectFilesWithHistory({
@@ -352,26 +302,10 @@ export function useTimelineEditing({
         const relevantElements = timelineElements.filter(
           (te) => (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath,
         );
-        const trackZIndices = buildTrackZIndexMap([
-          ...relevantElements.map((te) => te.track),
-          placement.track,
-        ]);
+        const newElementZIndex = Math.max(1, relevantElements.length + 1);
 
-        let patchedContent = originalContent;
-        for (const te of relevantElements) {
-          const elementTarget = buildPatchTarget(te);
-          if (!elementTarget) continue;
-          const nextZIndex = trackZIndices.get(te.track);
-          if (nextZIndex == null) continue;
-          patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-            type: "inline-style",
-            property: "z-index",
-            value: String(nextZIndex),
-          });
-        }
-
-        patchedContent = insertTimelineAssetIntoSource(
-          patchedContent,
+        const patchedContent = insertTimelineAssetIntoSource(
+          originalContent,
           buildTimelineAssetInsertHtml({
             id: newId,
             assetPath: resolvedAssetSrc,
@@ -379,7 +313,7 @@ export function useTimelineEditing({
             start: normalizedStart,
             duration: normalizedDuration,
             track: placement.track,
-            zIndex: trackZIndices.get(placement.track) ?? 1,
+            zIndex: newElementZIndex,
             geometry: resolveTimelineAssetInitialGeometry(originalContent),
           }),
         );
