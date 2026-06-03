@@ -98,11 +98,11 @@ export function useAskAgentModal({
         sourceFilePath: toProjectAbsolutePath(projectDir, targetPath),
       });
 
-      const copied = await copyTextToClipboard(prompt);
-      if (!copied) {
-        showToast("Could not copy prompt to clipboard.", "error");
-        return;
-      }
+      window.dispatchEvent(
+        new CustomEvent("ai-agent-prompt", {
+          detail: { prompt, selection: domEditSelection },
+        }),
+      );
 
       setAgentModalOpen(false);
       setAgentPromptSelectionContext(undefined);
