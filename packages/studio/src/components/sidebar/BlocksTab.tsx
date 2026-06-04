@@ -176,7 +176,7 @@ function CategoryPill({
   );
 }
 
-interface CompositionContext {
+export interface CompositionContext {
   currentTime: number;
   activeCompPath: string | null;
   elements: Array<{
@@ -190,7 +190,7 @@ interface CompositionContext {
   compositionDimensions?: { width: number; height: number };
 }
 
-function formatCompositionContext(ctx: CompositionContext): string {
+export function formatCompositionContext(ctx: CompositionContext): string {
   const lines: string[] = [
     `Playback time: ${formatTime(ctx.currentTime)}`,
     `Active composition: ${ctx.activeCompPath || "index.html"}`,
@@ -218,7 +218,7 @@ function formatCompositionContext(ctx: CompositionContext): string {
   return lines.join("\n");
 }
 
-function buildAgentPrompt(
+export function buildAgentPrompt(
   title: string,
   name: string,
   description: string,
@@ -492,7 +492,7 @@ function BlockCard({
   );
 }
 
-function PromptPreviewModal({
+export function PromptPreviewModal({
   title,
   prompt,
   onClose,

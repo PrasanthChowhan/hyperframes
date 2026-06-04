@@ -23,6 +23,7 @@ import { useConsoleErrorCapture } from "./hooks/useConsoleErrorCapture";
 import { useFrameCapture } from "./hooks/useFrameCapture";
 import { useLintModal } from "./hooks/useLintModal";
 import { useCompositionDimensions } from "./hooks/useCompositionDimensions";
+import { GlobalCatalogActionsManager } from "./components/GlobalCatalogActionsManager";
 import { useToast } from "./hooks/useToast";
 import { useStudioUrlState } from "./hooks/useStudioUrlState";
 import {
@@ -232,6 +233,7 @@ export function StudioApp() {
     },
     [projectId, blockCtx, panelLayout],
   );
+
   const handleTimelineBlockDrop = useCallback(
     (blockName: string, placement: { start: number; track: number }) => {
       if (!projectId) return;
@@ -369,6 +371,7 @@ export function StudioApp() {
   });
 
   const compositionDimensions = useCompositionDimensions();
+
   const { lintModal, linting, handleLint, closeLintModal } = useLintModal(projectId);
   const frameCapture = useFrameCapture({
     projectId,
@@ -579,6 +582,12 @@ export function StudioApp() {
                   {appToast.message}
                 </div>
               )}
+
+              <GlobalCatalogActionsManager 
+                handleAddBlock={handleAddBlock}
+                activeCompPath={activeCompPath}
+                compositionDimensions={compositionDimensions}
+              />
             </div>
           </DomEditProvider>
         </FileManagerProvider>

@@ -30,8 +30,14 @@ export { StudioApp } from "./App";
 // Hooks
 export { useElementPicker } from "./hooks/useElementPicker";
 export type { PickedElement } from "./hooks/useElementPicker";
+export { useBlockCatalog } from "./hooks/useBlockCatalog";
+export type { CatalogItem } from "./hooks/useBlockCatalog";
+export { PromptPreviewModal, buildAgentPrompt } from "./components/sidebar/BlocksTab";
+export type { CompositionContext } from "./components/sidebar/BlocksTab";
 
 // Utilities
 export { resolveSourceFile, applyPatch } from "./utils/sourcePatcher";
 export type { PatchOperation } from "./utils/sourcePatcher";
 export { parseStyleString, mergeStyleIntoTag, findElementBlock } from "./utils/htmlEditor";
+export { BLOCK_CATEGORIES, getCategoryColors } from "./utils/blockCategories";
+export type { BlockCategory } from "./utils/blockCategories";
