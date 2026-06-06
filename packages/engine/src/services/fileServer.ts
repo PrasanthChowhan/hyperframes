@@ -11,6 +11,7 @@ import { serve } from "@hono/node-server";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, extname } from "node:path";
 import { injectScriptsIntoHtml } from "@hyperframes/core/compiler";
+import { animakerFsMiddleware } from "./animakerFsMiddleware";
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -60,6 +61,9 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
   const bodyScripts = options.bodyScripts ?? [];
 
   const app = new Hono();
+
+  // Animaker v2 One-Line Injection: Intercept /@fs/ requests for Reference-in-Place media
+  app.use("/*", animakerFsMiddleware);
 
   app.get("/*", (c) => {
     let requestPath = c.req.path;

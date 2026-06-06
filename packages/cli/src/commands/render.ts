@@ -6,6 +6,7 @@ import {
   resolveVariablesArg,
   validateVariablesAgainstProject,
 } from "../utils/variables.js";
+import { resolveBrowserTimeoutMsArg, resolveCompositionEntryArg } from "../utils/renderArgs.js";
 
 export const examples: Example[] = [
   ["Render to MP4", "hyperframes render --output output.mp4"],
@@ -119,7 +120,8 @@ export default defineCommand({
       alias: "c",
       description:
         "Render a specific composition file instead of index.html (e.g. compositions/intro.html). " +
-        "Sub-compositions using <template> wrappers must be referenced from index.html via data-composition-src.",
+        "Sub-compositions using <template> wrappers must be referenced from index.html via data-composition-src. " +
+        "Pass `.` (or omit the flag) to render the project's index.html.",
     },
     output: {
       type: "string",
@@ -234,7 +236,49 @@ export default defineCommand({
         "Use --no-page-side-compositing to force the layered path.",
       default: true,
     },
+    "browser-timeout": {
+      type: "string",
+      description:
+        "Puppeteer page-navigation timeout in SECONDS for the entry HTML. " +
+        "Increase when heavy compositions (many videos / fonts / asset " +
+        "requests) cannot reach domcontentloaded within the 60s default " +
+        "(see issue #1199). Accepts 0.001-86400 (24h cap). " +
+        "Note: this controls page.goto only — very heavy compositions may " +
+        "also need PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS / " +
+        "PRODUCER_PLAYER_READY_TIMEOUT_MS bumped (the post-goto window.__hf " +
+        "readiness poll has its own 45s budget). " +
+        "Env fallback: PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS (MILLISECONDS).",
+    },
+    "protocol-timeout": {
+      type: "string",
+      description:
+        "CDP protocol timeout in ms. Increase on slow/low-memory machines " +
+        "where Chrome operations time out. Default: 300000 (5 min). " +
+        "Env: PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS.",
+    },
+    "player-ready-timeout": {
+      type: "string",
+      description:
+        "Timeout in ms for the composition player to become ready. " +
+        "Increase for complex compositions on slow hardware. Default: 45000 (45 s). " +
+        "Env: PRODUCER_PLAYER_READY_TIMEOUT_MS.",
+    },
+    "low-memory-mode": {
+      type: "boolean",
+      description:
+        "Force the low-memory safe render profile on (--low-memory-mode) or " +
+        "off (--no-low-memory-mode). Safe mode pins to 1 worker, uses " +
+        "screenshot capture, and skips auto-worker calibration to avoid " +
+        "memory thrash on constrained machines. Default: auto-detected from " +
+        "total RAM (<= 8 GB). Env: PRODUCER_LOW_MEMORY_MODE.",
+    },
   },
+  // `run` is the citty handler for `hyperframes render` — sequential flag
+  // validation + render dispatch. Inherited CRITICAL on main (CRAP 1290);
+  // this PR extracted --browser-timeout + --composition validators into
+  // `utils/renderArgs.ts`, reducing cyclomatic 75→65 and CRAP 1290→978.
+  // Full decomposition is tracked separately and out of scope for #1199.
+  // fallow-ignore-next-line complexity
   async run({ args }) {
     // ── Resolve project ────────────────────────────────────────────────────
     const project = resolveProject(args.dir);
@@ -305,9 +349,43 @@ export default defineCommand({
       workers = parsed;
     }
 
+    // ── Validate timeout overrides ─────────────────────────────────────
+    let protocolTimeout: number | undefined;
+    if (args["protocol-timeout"] != null) {
+      const parsed = parseInt(args["protocol-timeout"], 10);
+      if (isNaN(parsed) || parsed < 1000) {
+        errorBox(
+          "Invalid protocol-timeout",
+          `Got "${args["protocol-timeout"]}". Must be a number >= 1000 (ms).`,
+        );
+        process.exit(1);
+      }
+      protocolTimeout = parsed;
+    }
+    let playerReadyTimeout: number | undefined;
+    if (args["player-ready-timeout"] != null) {
+      const parsed = parseInt(args["player-ready-timeout"], 10);
+      if (isNaN(parsed) || parsed < 1000) {
+        errorBox(
+          "Invalid player-ready-timeout",
+          `Got "${args["player-ready-timeout"]}". Must be a number >= 1000 (ms).`,
+        );
+        process.exit(1);
+      }
+      playerReadyTimeout = parsed;
+    }
+
     // ── Wire opt-in: page-side compositing ───────────────────────────────
     if (args["page-side-compositing"] === false) {
       process.env.HF_PAGE_SIDE_COMPOSITING = "false";
+    }
+
+    // ── Override: low-memory safe profile (tri-state) ────────────────────
+    // Absent → auto-detect from total RAM inside resolveConfig. Explicit
+    // --low-memory-mode / --no-low-memory-mode forces it on/off via the env
+    // var the producer's resolveConfig reads.
+    if (args["low-memory-mode"] != null) {
+      process.env.PRODUCER_LOW_MEMORY_MODE = args["low-memory-mode"] ? "true" : "false";
     }
 
     // ── Validate max-concurrent-renders ─────────────────────────────────
@@ -326,6 +404,7 @@ export default defineCommand({
     // ── Resolve output path ───────────────────────────────────────────────
     const rendersDir = resolve("renders");
     const ext = FORMAT_EXT[format] ?? ".mp4";
+    // fallow-ignore-next-line code-duplication
     const now = new Date();
     const datePart = now.toISOString().slice(0, 10);
     const timePart = now.toTimeString().slice(0, 8).replace(/:/g, "-");
@@ -378,29 +457,12 @@ export default defineCommand({
       process.exit(1);
     }
 
-    // ── Validate composition entry file ──────────────────────────────────
-    const entryFile = args.composition?.trim().replace(/^\.\//, "") || undefined;
-    if (entryFile) {
-      const absProjectDir = resolve(project.dir);
-      const entryPath = resolve(absProjectDir, entryFile);
-      if (!entryPath.startsWith(absProjectDir)) {
-        errorBox(
-          "Invalid composition path",
-          `Entry file must stay inside the project directory: ${entryFile}`,
-        );
-        process.exit(1);
-      }
-      try {
-        statSync(entryPath);
-      } catch {
-        errorBox(
-          "Composition not found",
-          `"${entryFile}" does not exist in the project directory.`,
-          "Pass a path to a .html file relative to the project root (e.g. compositions/intro.html).",
-        );
-        process.exit(1);
-      }
-    }
+    // ── Validate browser-timeout (seconds) and composition entry file ────
+    // Both validators live in `utils/renderArgs.ts` so the parse/reject
+    // branches are unit-testable without `process.exit`. See issue #1199
+    // for the original EISDIR / silent-timeout-0 footguns this guards.
+    const pageNavigationTimeoutMs = resolveBrowserTimeoutMsArg(args["browser-timeout"]);
+    const entryFile = resolveCompositionEntryArg(args.composition, project.dir, statSync);
 
     // ── Print render plan ─────────────────────────────────────────────────
     if (!quiet) {
@@ -523,6 +585,9 @@ export default defineCommand({
         entryFile,
         outputResolution,
         pageSideCompositing: args["page-side-compositing"] !== false,
+        pageNavigationTimeoutMs,
+        protocolTimeout,
+        playerReadyTimeout,
         exitAfterComplete: true,
       });
     } else {
@@ -541,6 +606,9 @@ export default defineCommand({
         variables,
         entryFile,
         outputResolution,
+        pageNavigationTimeoutMs,
+        protocolTimeout,
+        playerReadyTimeout,
         exitAfterComplete: true,
       });
     }
@@ -570,6 +638,17 @@ interface RenderOptions {
   /** Output resolution preset; see `resolveDeviceScaleFactor` for constraints. */
   outputResolution?: CanvasResolution;
   pageSideCompositing?: boolean;
+  /**
+   * Puppeteer `page.goto()` timeout for the entry HTML, in milliseconds.
+   * When omitted, the engine default (60s) applies. Surfaced as
+   * `--browser-timeout <seconds>` at the CLI and threaded through to the
+   * producer's EngineConfig override.
+   */
+  pageNavigationTimeoutMs?: number;
+  /** CDP protocol timeout override (ms). */
+  protocolTimeout?: number;
+  /** Player-ready timeout override (ms). */
+  playerReadyTimeout?: number;
 }
 
 /**
@@ -736,6 +815,9 @@ function resolveDockerHostPlatform(options: RenderOptions): string {
   return platform;
 }
 
+// Inherited minor finding (CRAP 37.1, cyclomatic 11). This PR only added
+// `pageNavigationTimeoutMs` to the options forwarded to `buildDockerRunArgs`.
+// fallow-ignore-next-line complexity
 async function renderDocker(
   projectDir: string,
   outputPath: string,
@@ -790,6 +872,7 @@ async function renderDocker(
       entryFile: options.entryFile,
       outputResolution: options.outputResolution,
       pageSideCompositing: options.pageSideCompositing,
+      pageNavigationTimeoutMs: options.pageNavigationTimeoutMs,
     },
   });
 
@@ -831,6 +914,7 @@ async function renderDocker(
   if (options.exitAfterComplete) scheduleRenderProcessExit();
 }
 
+// fallow-ignore-next-line complexity
 export async function renderLocal(
   projectDir: string,
   outputPath: string,
@@ -865,6 +949,11 @@ export async function renderLocal(
     useGpu: options.gpu,
     producerConfig: producer.resolveConfig({
       browserGpuMode: options.browserGpuMode ?? "software",
+      ...(options.pageNavigationTimeoutMs != null
+        ? { pageNavigationTimeout: options.pageNavigationTimeoutMs }
+        : {}),
+      ...(options.protocolTimeout != null && { protocolTimeout: options.protocolTimeout }),
+      ...(options.playerReadyTimeout != null && { playerReadyTimeout: options.playerReadyTimeout }),
     }),
     hdrMode: options.hdrMode,
     crf: options.crf,
@@ -958,6 +1047,9 @@ function handleRenderError(
  * Extract rich metrics from the completed render job and send to telemetry.
  * speed_ratio = composition_duration / render_time — higher is better, >1 means faster than realtime.
  */
+// Inherited CRITICAL (CRAP 148.4, cyclomatic 24): exhaustive nullish-fallback
+// chain across 30+ telemetry fields. Not touched by this PR.
+// fallow-ignore-next-line complexity
 function trackRenderMetrics(
   job: RenderJob,
   elapsedMs: number,

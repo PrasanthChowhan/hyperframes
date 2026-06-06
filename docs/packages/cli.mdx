@@ -616,6 +616,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | `--hdr` | — | off | Force HDR output even if no HDR sources are detected. MP4 only. See [HDR Rendering](/guides/hdr) |
     | `--sdr` | — | off | Force SDR output even if HDR sources are detected |
     | `--workers` | 1-8 | 4 | Parallel render workers |
+    | `--low-memory-mode` / `--no-low-memory-mode` | — | auto (≤ 8 GB RAM) | Force the low-memory safe render profile on or off. Safe mode pins to 1 worker, uses screenshot capture, and skips auto-worker calibration so the pipeline doesn't launch multiple concurrent Chrome instances on constrained machines. Auto-detection reads **host** RAM (`os.totalmem()`), not cgroup/container limits — containerised or serverless callers (incl. `--docker`) should set `PRODUCER_LOW_MEMORY_MODE` explicitly. Env fallback `PRODUCER_LOW_MEMORY_MODE`. |
     | `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, AMF, VAAPI, QSV) |
     | `--browser-gpu` / `--no-browser-gpu` | — | on locally, off in Docker | Use or opt out of host GPU acceleration for local Chrome/WebGL capture |
     | `--docker` | — | off | Use Docker for [deterministic rendering](/concepts/determinism) |
@@ -623,6 +624,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | `--variables` | JSON object | — | Variable overrides merged over `data-composition-variables` defaults. Read via `window.__hyperframes.getVariables()` |
     | `--variables-file` | path | — | Path to a JSON file with variable overrides (alternative to `--variables`) |
     | `--strict-variables` | — | off | Fail render if any `--variables` key is undeclared or has a wrong type vs the composition's `data-composition-variables`. Without this flag, mismatches print as warnings and the render continues. |
+    | `--browser-timeout` | seconds (0.001–86400) | 60 | Puppeteer page-navigation timeout for the entry HTML. Increase when heavy compositions (many videos, fonts, or asset requests) cannot reach `domcontentloaded` within the default 60 s. The flag takes **seconds**; the env fallback `PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS` takes **milliseconds**. This controls `page.goto` only — very heavy compositions may also need `PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS` and/or `PRODUCER_PLAYER_READY_TIMEOUT_MS` bumped (post-navigation `window.__hf` readiness has its own 45 s budget). |
 
     CRF and target bitrate default to the `--quality` preset. Use `--crf` or `--video-bitrate` for fine-grained overrides; `RenderConfig.crf` and `RenderConfig.videoBitrate` accept the same overrides programmatically.
 
