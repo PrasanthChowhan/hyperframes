@@ -39,6 +39,7 @@ import { StudioHeader } from "./components/StudioHeader";
 import { StudioLeftSidebar } from "./components/StudioLeftSidebar";
 import { StudioPreviewArea } from "./components/StudioPreviewArea";
 import { StudioRightPanel } from "./components/StudioRightPanel";
+import { RightPanelPortal } from "./components/RightPanelPortal";
 import { TimelineToolbar } from "./components/TimelineToolbar";
 import { StudioProvider } from "./contexts/StudioContext";
 import { PanelLayoutProvider } from "./contexts/PanelLayoutContext";
@@ -546,16 +547,18 @@ export function StudioApp() {
                 />
 
                 {!panelLayout.rightCollapsed && (
-                  <StudioRightPanel
-                    selectedStudioMotion={selectedStudioMotion}
-                    designPanelActive={designPanelActive}
-                    motionPanelActive={motionPanelActive}
-                    activeBlockParams={activeBlockParams}
-                    onCloseBlockParams={() => {
-                      setActiveBlockParams(null);
-                      panelLayout.setRightPanelTab("design");
-                    }}
-                  />
+                  <RightPanelPortal>
+                    <StudioRightPanel
+                      selectedStudioMotion={selectedStudioMotion}
+                      designPanelActive={designPanelActive}
+                      motionPanelActive={motionPanelActive}
+                      activeBlockParams={activeBlockParams}
+                      onCloseBlockParams={() => {
+                        setActiveBlockParams(null);
+                        panelLayout.setRightPanelTab("design");
+                      }}
+                    />
+                  </RightPanelPortal>
                 )}
               </div>
 
