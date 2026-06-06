@@ -6,7 +6,7 @@ export interface MediaProbeResult {
   hasAudio: boolean;
 }
 
-const cache = new Map<string, MediaProbeResult>();
+const cache = new Map<string, MediaProbeResult | null>();
 const inflight = new Map<string, Promise<MediaProbeResult | null>>();
 
 let mediabunnyModule: typeof import("mediabunny") | null | false = null;
@@ -61,7 +61,7 @@ async function probeOne(url: string): Promise<MediaProbeResult | null> {
   }
 }
 
-export function getCachedProbe(url: string): MediaProbeResult | undefined {
+export function getCachedProbe(url: string): MediaProbeResult | null | undefined {
   return cache.get(normalizeUrl(url));
 }
 
@@ -75,7 +75,7 @@ export async function probeMediaUrl(url: string): Promise<MediaProbeResult | nul
 
   pending = probeOne(key).then((result) => {
     inflight.delete(key);
-    if (result) cache.set(key, result);
+    cache.set(key, result);
     return result;
   });
   inflight.set(key, pending);

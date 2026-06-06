@@ -107,7 +107,7 @@ export function useTimelinePlayer() {
           el.src &&
           el.sourceDuration == null &&
           ["video", "audio"].includes(el.tag.toLowerCase()) &&
-          !getCachedProbe(el.src),
+          getCachedProbe(el.src) === undefined,
       );
       if (needsProbe.length > 0) {
         void Promise.allSettled(
