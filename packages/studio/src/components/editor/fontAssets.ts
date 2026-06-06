@@ -13,7 +13,12 @@ function cssString(value: string): string {
 }
 
 export function fontFamilyFromAssetPath(path: string): string {
-  const fileName = decodeURIComponent(path.split(/[\\/]/).pop() ?? path).replace(FONT_EXT_RE, "");
+  let fileName = path.split(/[\\/]/).pop() ?? path;
+  try {
+    fileName = decodeURIComponent(fileName);
+  } catch (e) {
+  }
+  fileName = fileName.replace(FONT_EXT_RE, "");
   let family = fileName
     .replace(/[_-]+/g, " ")
     .replace(/([a-z])([A-Z])/g, "$1 $2")

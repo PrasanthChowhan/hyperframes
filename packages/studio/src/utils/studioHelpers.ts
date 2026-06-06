@@ -26,7 +26,12 @@ export function getTimelineElementLabel(element: TimelineElement): string {
 function normalizeProjectAssetPath(value: string): string {
   const trimmed = value.trim();
   const maybeUrl = /^[a-z]+:\/\//i.test(trimmed) ? new URL(trimmed).pathname : trimmed;
-  return decodeURIComponent(maybeUrl)
+  let decoded = maybeUrl;
+  try {
+    decoded = decodeURIComponent(maybeUrl);
+  } catch (e) {
+  }
+  return decoded
     .replace(/\\/g, "/")
     .replace(/^\.?\//, "");
 }

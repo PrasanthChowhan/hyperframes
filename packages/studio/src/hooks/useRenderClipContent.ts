@@ -90,13 +90,19 @@ export function useRenderClipContent({
       if (el.tag === "audio") {
         const previewBase = `/api/projects/${pid}/preview/`;
         const previewIdx = el.src?.startsWith("http") ? el.src.indexOf(previewBase) : -1;
-        const srcRelative = el.src
-          ? previewIdx !== -1
-            ? decodeURIComponent(el.src.slice(previewIdx + previewBase.length))
-            : el.src.startsWith("http")
-              ? null
-              : el.src
-          : null;
+        let srcRelative: string | null = null;
+        if (el.src) {
+          if (previewIdx !== -1) {
+            const raw = el.src.slice(previewIdx + previewBase.length);
+            try {
+              srcRelative = decodeURIComponent(raw);
+            } catch {
+              srcRelative = raw;
+            }
+          } else if (!el.src.startsWith("http")) {
+            srcRelative = el.src;
+          }
+        }
         const audioUrl = srcRelative
           ? `/api/projects/${pid}/preview/${srcRelative}`
           : (el.src ?? "");

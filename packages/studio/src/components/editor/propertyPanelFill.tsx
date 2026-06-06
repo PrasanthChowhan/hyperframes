@@ -24,7 +24,13 @@ import { ColorField } from "./propertyPanelColor";
 function normalizeProjectPath(value: string): string {
   const trimmed = value.trim();
   const maybeUrl = /^[a-z]+:\/\//i.test(trimmed) ? new URL(trimmed).pathname : trimmed;
-  return decodeURIComponent(maybeUrl)
+  let decoded = maybeUrl;
+  try {
+    decoded = decodeURIComponent(maybeUrl);
+  } catch (e) {
+    // If it fails to decode, fallback to the original string
+  }
+  return decoded
     .replace(/\\/g, "/")
     .replace(/^\.?\//, "");
 }
