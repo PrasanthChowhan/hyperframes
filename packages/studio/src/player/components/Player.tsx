@@ -149,15 +149,46 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       let cleanup: (() => void) | undefined;
 
       // Dynamic import registers the custom element in the browser only.
-      import("@hyperframes/player").then(() => {
+      import("@hyperframes/player").then(async () => {
         if (canceled) return;
 
         // Create the web component imperatively to avoid JSX custom-element typing.
         const player = document.createElement("hyperframes-player") as HyperframesPlayerElement;
-        const src = directUrl || `/api/projects/${projectId}/preview`;
-        player.setAttribute("shader-capture-scale", "1");
-        player.setAttribute("shader-loading", "player");
-        player.setAttribute("src", src);
+        
+        let src = directUrl || `/api/projects/${projectId}/preview`;
+        const enginePort = (window as any).__enginePort;
+        
+        if (enginePort && src.startsWith('/api/')) {
+          const engineUrl = `http://127.0.0.1:${enginePort}`;
+          try {
+            // Fetch the HTML via the intercepted window.fetch (which uses tauriFetch)
+            const res = await fetch(`${engineUrl}${src}`);
+            let html = await res.text();
+            
+            if (canceled) return;
+            
+            // Inject <base> tag so relative paths (scripts, images, etc.) load from the engine's preview directory
+            // Ensure we append the exact preview path so relative project assets don't 404 at the engine root.
+            const baseHref = src.endsWith('/') ? `${engineUrl}${src}` : `${engineUrl}${src}/`;
+            html = html.replace(/<head\b[^>]*>/i, (match) => `${match}<base href="${baseHref}">`);
+            
+            player.setAttribute("shader-capture-scale", "1");
+            player.setAttribute("shader-loading", "player");
+            player.setAttribute("srcdoc", html);
+            
+            // Skip the standard src assignment
+            src = "";
+          } catch (e) {
+            console.error("Failed to load iframe HTML for srcdoc", e);
+            src = `${engineUrl}${src}`; // Fallback
+          }
+        }
+
+        if (src) {
+          player.setAttribute("shader-capture-scale", "1");
+          player.setAttribute("shader-loading", "player");
+          player.setAttribute("src", src);
+        }
         player.setAttribute("width", String(portrait ? 1080 : 1920));
         player.setAttribute("height", String(portrait ? 1920 : 1080));
         player.style.width = "100%";

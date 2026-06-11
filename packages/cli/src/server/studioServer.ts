@@ -535,10 +535,11 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
   app.all("/api/*", async (c) => {
     const url = new URL(c.req.url);
     url.pathname = url.pathname.slice(4); // Strip "/api" prefix
+    const body = ["GET", "HEAD"].includes(c.req.method) ? undefined : c.req.raw.body;
     const forwardReq = new Request(url.toString(), {
       method: c.req.method,
       headers: c.req.raw.headers,
-      body: c.req.raw.body,
+      body,
       // @ts-expect-error -- Node needs duplex for streaming bodies
       duplex: "half",
     });
