@@ -181,7 +181,7 @@ export default defineCommand({
 
     // If @hyperframes/studio is installed locally, use Vite for full HMR
     if (hasLocalStudio(dir)) {
-      return runLocalStudioMode(dir, {
+      return runLocalStudioMode(dir, startPort, {
         projectName,
         noOpen,
         browserPath,
@@ -267,7 +267,9 @@ async function runDevMode(
     const text = data.toString();
 
     // Detect Vite URL
-    const localMatch = text.match(/Local:\s+(http:\/\/localhost:\d+)/);
+    // Strip ANSI escape codes before matching
+    const strippedText = text.replace(/\x1B\[[0-9;]*m/g, "");
+    const localMatch = strippedText.match(/Local:\s+(http:\/\/localhost:\d+)/);
     if (localMatch && !frontendUrl) {
       frontendUrl = localMatch[1] ?? "";
       s.stop(c.success("Studio running"));
@@ -347,6 +349,7 @@ function hasLocalStudio(dir: string): boolean {
  */
 async function runLocalStudioMode(
   dir: string,
+  startPort: number,
   options?: {
     projectName?: string;
     noOpen?: boolean;
@@ -381,7 +384,7 @@ async function runLocalStudioMode(
   const s = clack.spinner();
   s.start("Starting studio...");
 
-  const child = spawn("npx", ["vite"], {
+  const child = spawn("npx", ["vite", "--port", startPort.toString()], {
     cwd: studioPkgPath,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -390,7 +393,8 @@ async function runLocalStudioMode(
 
   function handleOutput(data: Buffer): void {
     const text = data.toString();
-    const localMatch = text.match(/Local:\s+(http:\/\/localhost:\d+)/);
+    const strippedText = text.replace(/\x1B\[[0-9;]*m/g, "");
+    const localMatch = strippedText.match(/Local:\s+(http:\/\/localhost:\d+)/);
     if (localMatch && !detected) {
       detected = true;
       const url = localMatch[1] ?? "";

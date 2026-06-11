@@ -372,7 +372,11 @@ export async function findPortAndServe(
           server!.once("listening", onListening);
           server!.listen(port, host);
         });
-        return { type: "started", server, port };
+        
+        const addr = server!.address();
+        const actualPort = typeof addr === "object" && addr ? addr.port : port;
+        
+        return { type: "started", server, port: actualPort };
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
           continue;
