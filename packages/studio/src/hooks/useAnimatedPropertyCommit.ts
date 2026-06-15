@@ -8,9 +8,11 @@
  */
 import { useCallback } from "react";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
+import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import { usePlayerStore } from "../player/store/playerStore";
 import { readAllAnimatedProperties, readGsapProperty } from "./gsapRuntimeBridge";
+import { selectorFromSelection, computeElementPercentage } from "./gsapShared";
 
 interface CommitAnimatedPropertyDeps {
   selectedGsapAnimations: GsapAnimation[];
@@ -36,19 +38,28 @@ interface CommitAnimatedPropertyDeps {
   bumpGsapCache: () => void;
 }
 
-function computePercentage(selection: DomEditSelection): number {
-  const elStart = Number.parseFloat(selection.dataAttributes?.start ?? "0") || 0;
-  const elDuration = Number.parseFloat(selection.dataAttributes?.duration ?? "1") || 1;
+function pickBestAnimation(
+  animations: GsapAnimation[],
+  selector: string | null,
+  property?: string,
+): GsapAnimation | undefined {
+  if (animations.length <= 1) return animations[0];
   const currentTime = usePlayerStore.getState().currentTime;
-  return elDuration > 0
-    ? Math.max(0, Math.min(100, Math.round(((currentTime - elStart) / elDuration) * 1000) / 10))
-    : 0;
-}
+  const targetGroup = property ? classifyPropertyGroup(property) : undefined;
 
-function selectorFor(selection: DomEditSelection): string | null {
-  if (selection.id) return `#${selection.id}`;
-  if (selection.selector) return selection.selector;
-  return null;
+  const scored = animations.map((a) => {
+    let score = 0;
+    if (targetGroup && a.propertyGroup === targetGroup) score += 20;
+    if (a.keyframes) score += 10;
+    if (selector && a.targetSelector === selector) score += 5;
+    else if (a.targetSelector.includes(",")) score -= 3;
+    const pos = a.resolvedStart ?? (typeof a.position === "number" ? a.position : 0);
+    const dur = a.duration ?? 0;
+    if (currentTime >= pos - 0.05 && currentTime <= pos + dur + 0.05) score += 8;
+    return { anim: a, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.anim;
 }
 
 export function useAnimatedPropertyCommit(deps: CommitAnimatedPropertyDeps) {
@@ -69,11 +80,13 @@ export function useAnimatedPropertyCommit(deps: CommitAnimatedPropertyDeps) {
       if (!gsapCommitMutation) return;
 
       const iframe = previewIframeRef.current;
-      const selector = selectorFor(selection);
-      const pct = computePercentage(selection);
+      const selector = selectorFromSelection(selection);
 
-      let anim: GsapAnimation | undefined =
-        selectedGsapAnimations.find((a) => a.keyframes) ?? selectedGsapAnimations[0];
+      let anim: GsapAnimation | undefined = pickBestAnimation(
+        selectedGsapAnimations,
+        selector,
+        property,
+      );
 
       // Case 3: No animation — create one first
       if (!anim) {
@@ -97,6 +110,8 @@ export function useAnimatedPropertyCommit(deps: CommitAnimatedPropertyDeps) {
         );
       }
 
+      const pct = computeElementPercentage(usePlayerStore.getState().currentTime, selection, anim);
+
       // Read all currently animated properties from runtime for backfill
       const runtimeProps = selector ? readAllAnimatedProperties(iframe, selector, anim) : {};
 
@@ -112,15 +127,26 @@ export function useAnimatedPropertyCommit(deps: CommitAnimatedPropertyDeps) {
       }
       backfillDefaults[property] = typeof value === "number" ? value : value;
 
+      const existingKf = anim.keyframes?.keyframes.some(
+        (kf) => Math.abs(kf.percentage - pct) < 0.05,
+      );
+
       await gsapCommitMutation(
         selection,
-        {
-          type: "add-keyframe",
-          animationId: anim.id,
-          percentage: pct,
-          properties,
-          backfillDefaults,
-        },
+        existingKf
+          ? {
+              type: "update-keyframe",
+              animationId: anim.id,
+              percentage: pct,
+              properties,
+            }
+          : {
+              type: "add-keyframe",
+              animationId: anim.id,
+              percentage: pct,
+              properties,
+              backfillDefaults,
+            },
         { label: `Edit ${property} (keyframe ${pct}%)`, softReload: true },
       );
     },

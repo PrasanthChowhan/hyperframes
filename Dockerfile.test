@@ -66,7 +66,7 @@ RUN npx --yes @puppeteer/browsers install chrome-headless-shell@148.0.7778.167 \
 WORKDIR /app
 
 # Install bun
-RUN curl -fsSL https://bun.sh/install | bash
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL="/root/.bun" bash -s "bun-v1.3.13"
 ENV PATH="/root/.bun/bin:$PATH"
 
 # Install dependencies (full, including devDependencies for tsx + test harness)
@@ -80,6 +80,7 @@ COPY packages/studio/package.json packages/studio/package.json
 COPY packages/shader-transitions/package.json packages/shader-transitions/package.json
 COPY packages/aws-lambda/package.json packages/aws-lambda/package.json
 COPY packages/gcp-cloud-run/package.json packages/gcp-cloud-run/package.json
+COPY packages/sdk/package.json packages/sdk/package.json
 RUN bun install --frozen-lockfile
 
 # Copy source

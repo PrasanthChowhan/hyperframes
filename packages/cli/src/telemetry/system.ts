@@ -1,6 +1,7 @@
-import { cpus, totalmem, freemem, platform, release } from "node:os";
+import { cpus, freemem, platform, release } from "node:os";
 import { existsSync, readFileSync, statfsSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { getSystemTotalMb } from "@hyperframes/engine";
 import {
   detectAgentRuntime,
   detectSandboxRuntime,
@@ -39,10 +40,11 @@ export interface SystemMeta {
    */
   sandbox_runtime: SandboxRuntime;
   /**
-   * Coding-agent vendor that spawned this process, if any (claude_code,
-   * codex, cursor, copilot_agent, replit, hermes, openclaw, pi).
-   * Detected by env-var existence only — values are never read. Every rule
-   * keys on a marker that has a public-source citation in agent_runtime.ts;
+   * Coding-agent vendor that spawned this process, if any (see the
+   * `AgentRuntime` union in agent_runtime.ts for the full, current set).
+   * Most rules check env-var existence only — values are never read; a few
+   * use filesystem/kernel markers (e.g. the Gemini managed-agent mount).
+   * Every rule keys on a marker with a source citation in agent_runtime.ts;
    * unverified guesses are deliberately omitted (false-negative > guess).
    * null when no agent is detected.
    */
@@ -66,7 +68,7 @@ export function getSystemMeta(): SystemMeta {
     cpu_count: cpuInfo.length,
     cpu_model: firstCpu?.model?.trim() ?? null,
     cpu_speed: firstCpu?.speed ?? null,
-    memory_total_mb: bytesToMb(totalmem()),
+    memory_total_mb: getSystemTotalMb(),
     is_docker: detectDocker(),
     is_ci: detectCI(),
     ci_name: getCIName(),

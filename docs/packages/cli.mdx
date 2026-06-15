@@ -19,7 +19,7 @@ npx hyperframes <command>
 - Preview compositions with live hot reload (`preview`)
 - Render compositions to MP4 locally or in Docker (`render`)
 - Lint compositions for structural issues (`lint`)
-- Inspect rendered visual layout for text overflow and clipped containers (`inspect`)
+- Inspect rendered visual layout for text overflow, clipped containers, and overlapping text (`inspect`)
 - Capture key frames as PNG screenshots (`snapshot`)
 - Check your environment for missing dependencies (`doctor`)
 
@@ -430,7 +430,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
 
     The capture command extracts everything an AI agent needs to understand a website's visual identity: viewport screenshots at every scroll depth, color palette (pixel-sampled + DOM computed), font files, images with semantic names, SVGs, Lottie animations, video previews, WebGL shaders, visible text, and page structure.
 
-    Output is a self-contained directory with a `CLAUDE.md` file that any AI agent can read to understand the captured site. Used by the `/website-to-hyperframes` skill as step 1 of the video production pipeline.
+    Output is a self-contained directory with a `CLAUDE.md` file that any AI agent can read to understand the captured site. Used by the `/website-to-video` skill as step 1 of the video production pipeline.
 
     Set `GEMINI_API_KEY` in a `.env` file for AI-powered image descriptions via Gemini vision (~$0.001/image). See the [Website to Video](/guides/website-to-video#enriching-captures-with-gemini-vision) guide for details.
 
@@ -512,6 +512,33 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
 
     The linter detects missing attributes, missing adapter libraries (GSAP, Lottie, Three.js), structural problems, and more. See [Common Mistakes](/guides/common-mistakes) for details on each rule.
 
+    ### `beats`
+
+    Detect the beats in a composition's music track and write them to a beat file the Studio uses to draw beat guides on the timeline:
+
+    ```bash
+    npx hyperframes beats [dir]
+    npx hyperframes beats [dir] --json   # machine-readable JSON output
+    ```
+
+    The command finds the music track (an `<audio>` element with `data-timeline-role="music"`, or an id like `music`/`bgm`/`soundtrack`), runs the **same** detection the Studio uses inside a headless Chrome (identical decode + BPM analysis), and writes `beats/<audio-path>.json`:
+
+    ```json
+    {
+      "version": 1,
+      "audio": "music.wav",
+      "beats": [{ "time": 2.027, "strength": 0.924 }]
+    }
+    ```
+
+    Run it when authoring a composition so the beat file exists **before** the Studio is opened — the Studio loads this file as-is (it only auto-generates one when none exists). `time` is in seconds into the audio file; `strength` (0–1) is the beat's relative loudness. Beats edited in the Studio (add/move/delete) persist back to the same file.
+
+    | Flag | Description |
+    |------|-------------|
+    | `--json` | Output `{ ok, file, count, bpm }` as JSON |
+
+    Requires a local Chrome (the same one used by `render`; run `npx hyperframes browser ensure` if missing). Detection runs the **same** algorithm the Studio uses; results are near-identical (a different headless-Chrome audio sample rate can shift beat times by a frame or two).
+
     ### `inspect`
 
     Inspect rendered visual layout across the composition timeline:
@@ -532,7 +559,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     ◇  1 error(s), 0 warning(s), 0 info(s)
     ```
 
-    `inspect` bundles the project, serves it locally, opens headless Chrome, seeks through the composition, and reports text or elements that escape their intended boxes. It is designed for agent workflows: each finding includes a schema version, timestamp or collapsed timestamp range, selector, nearest container selector, measured bounding boxes, overflow sides, and a fix hint.
+    `inspect` bundles the project, serves it locally, opens headless Chrome, seeks through the composition, and reports text or elements that escape their intended boxes, plus pairs of text blocks that overlap each other (`content_overlap`) and text that is hidden beneath an opaque element (`text_occluded`). It is designed for agent workflows: each finding includes a schema version, timestamp or collapsed timestamp range, selector, nearest container selector, measured bounding boxes, overflow sides, and a fix hint.
 
     | Flag | Description |
     |------|-------------|
@@ -545,7 +572,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | `--max-issues` | Maximum findings to print or return after static collapse (default: 80) |
     | `--strict` | Exit non-zero on warnings as well as errors |
 
-    Use `data-layout-allow-overflow` on an element or ancestor when overflow is intentional, such as a planned off-canvas entrance. Use `data-layout-ignore` for decorative elements that should not be audited.
+    Use `data-layout-allow-overflow` on an element or ancestor when overflow is intentional, such as a planned off-canvas entrance. Use `data-layout-ignore` for decorative elements that should not be audited. Use `data-layout-allow-overlap` on a text element that is intentionally stacked over another (for example a lower-third caption above a heading). Use `data-layout-allow-occlusion` when text is intentionally layered beneath another element (for example a caption behind a foreground prop).
 
     `layout` remains available as a compatibility alias for the same visual inspection pass:
 
@@ -1234,7 +1261,7 @@ Tar + upload a project to GCS once and reuse it across renders. `--site-id` over
 
 #### `cloudrun render <projectDir>`
 
-Start a distributed render. `--width` / `--height` are required; `--fps` (24/30/60), `--format`, `--codec`, `--quality`, `--chunk-size`, `--max-parallel-chunks`, and `--output-resolution` (deviceScaleFactor supersampling, e.g. `4k`) mirror the local render flags. Pass composition variables with `--variables '{"title":"Hi"}'` or `--variables-file alice.json`; add `--strict-variables` to fail on a key that's undeclared or mistyped vs the composition's `data-composition-variables`. `--wait` polls until the render finishes and prints the output URI + cost; without it the command returns an execution name.
+Start a distributed render. `--width` / `--height` are required; `--fps` (24/30/60), `--format`, `--codec`, `--quality`, `--chunk-size`, `--max-parallel-chunks`, `--target-chunk-frames`, and `--output-resolution` (deviceScaleFactor supersampling, e.g. `4k`) mirror the local render flags. `--target-chunk-frames` caps the frames per chunk so a single chunk can't run past a per-chunk timeout on a long video: the planner uses the fewest chunks that keep each at or below the bound, up to `--max-parallel-chunks`, and short videos still collapse to fewer chunks. It's a ceiling, not a fixed size, and is ignored when `--chunk-size` is set. Pass composition variables with `--variables '{"title":"Hi"}'` or `--variables-file alice.json`; add `--strict-variables` to fail on a key that's undeclared or mistyped vs the composition's `data-composition-variables`. `--wait` polls until the render finishes and prints the output URI + cost; without it the command returns an execution name.
 
 #### `cloudrun render-batch <projectDir>`
 

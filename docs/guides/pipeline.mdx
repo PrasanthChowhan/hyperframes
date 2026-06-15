@@ -178,6 +178,8 @@ The pipeline delivers the localhost Studio URL as the handoff. Your AI agent run
 npx hyperframes render --output my-video.mp4
 ```
 
+For personalized or catalog outputs, render the same validated composition with `--batch rows.json --output "renders/{name}.mp4"` and use the generated `manifest.json` as the delivery checklist.
+
 **Gate:** `lint` and `validate` pass with zero errors. Snapshot frames look right. The Studio preview URL is ready to share.
 
 ## Iterating
@@ -195,7 +197,7 @@ Each artifact is a checkpoint, so you can stop, hand off to a human reviewer, or
 
 The pipeline is the recommended structure for:
 
-- Capturing a website with the [/website-to-hyperframes](/guides/prompting) skill, which follows it end-to-end.
+- Capturing a website with the [/website-to-video](/guides/website-to-video) skill, which follows it end-to-end.
 - Shipping a product launch. Most of the [HeyGen launch videos](/launch-videos) use this artifact layout.
 - Any narrative video with three or more beats, where a storyboard pays for itself.
 - Learning Hyperframes, because the artifacts leave every creative decision inspectable on disk.

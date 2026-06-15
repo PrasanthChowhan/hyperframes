@@ -149,7 +149,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       let cleanup: (() => void) | undefined;
 
       // Dynamic import registers the custom element in the browser only.
-      import("@hyperframes/player").then(() => {
+      import("@hyperframes/player").then(async () => {
         if (canceled) return;
 
         // Create the web component imperatively to avoid JSX custom-element typing.

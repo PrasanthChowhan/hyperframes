@@ -1,4 +1,6 @@
 import { parseHTML } from "linkedom";
+import postcss from "postcss";
+import selectorParser from "postcss-selector-parser";
 
 export interface SourceMutationTarget {
   id?: string | null;
@@ -16,6 +18,36 @@ function parseSourceDocument(source: string): { document: Document; wrappedFragm
     document: parseHTML(`<!DOCTYPE html><html><head></head><body>${source}</body></html>`).document,
     wrappedFragment: true,
   };
+}
+
+function duplicateCssRulesForId(document: Document, originalId: string, newId: string): void {
+  const idToken = `#${originalId}`;
+  const transform = selectorParser((selectors) => {
+    selectors.walkIds((node) => {
+      if (node.value === originalId) node.value = newId;
+    });
+  });
+  for (const styleEl of document.querySelectorAll("style")) {
+    const css = styleEl.textContent ?? "";
+    let root: postcss.Root;
+    try {
+      root = postcss.parse(css);
+    } catch {
+      continue;
+    }
+    const clones: postcss.Rule[] = [];
+    root.walkRules((rule) => {
+      if (!rule.selector.includes(idToken)) return;
+      const newSelector = transform.processSync(rule.selector);
+      if (newSelector === rule.selector) return;
+      const clone = rule.clone({ selector: newSelector });
+      clones.push(clone);
+    });
+    if (clones.length > 0) {
+      for (const c of clones) root.append(c);
+      styleEl.textContent = root.toString();
+    }
+  }
 }
 
 function querySelectorAllWithTemplates(root: Document | Element, selector: string): Element[] {
@@ -90,7 +122,7 @@ export function removeElementFromHtml(source: string, target: SourceMutationTarg
   return wrappedFragment ? document.body.innerHTML || "" : document.toString();
 }
 
-function isHTMLElement(el: Element): boolean {
+export function isHTMLElement(el: Element): el is HTMLElement {
   const HTMLEl = el.ownerDocument.defaultView?.HTMLElement;
   return HTMLEl ? el instanceof HTMLEl : "style" in el;
 }
@@ -191,6 +223,58 @@ function isSafeAttributeValue(name: string, value: string): boolean {
   return true;
 }
 
+// fallow-ignore-next-line complexity
+function patchStyleAttrString(style: string, property: string, value: string | null): string {
+  const props = new Map<string, string>();
+  const order: string[] = [];
+  // Tokenize declarations robustly: values can contain ';' inside quoted strings
+  // (e.g. content: ';') and ':' inside values (data URIs, url(), etc.).
+  // Split on ';' only when outside quotes and balanced parens; the first ':' in
+  // the resulting segment is the property/value separator (property names never
+  // contain ':').
+  let i = 0;
+  while (i < style.length) {
+    let depth = 0;
+    let inSingle = false;
+    let inDouble = false;
+    const start = i;
+    while (i < style.length) {
+      const ch = style[i];
+      if (ch === "'" && !inDouble) inSingle = !inSingle;
+      else if (ch === '"' && !inSingle) inDouble = !inDouble;
+      else if (!inSingle && !inDouble) {
+        if (ch === "(") depth++;
+        else if (ch === ")") depth = Math.max(0, depth - 1);
+        else if (ch === ";" && depth === 0) break;
+      }
+      i++;
+    }
+    const decl = style.slice(start, i).trim();
+    i++; // advance past ';'
+    if (!decl) continue;
+    const colon = decl.indexOf(":");
+    if (colon < 0) continue;
+    const key = decl.slice(0, colon).trim();
+    const val = decl.slice(colon + 1).trim();
+    if (!key) continue;
+    if (!props.has(key)) order.push(key);
+    props.set(key, val);
+  }
+  if (value === null) {
+    props.delete(property);
+    const idx = order.indexOf(property);
+    if (idx >= 0) order.splice(idx, 1);
+  } else {
+    if (!props.has(property)) order.push(property);
+    props.set(property, value);
+  }
+  return order
+    .map((k) => `${k}: ${props.get(k) ?? ""}`)
+    .filter((d) => d.trim())
+    .join("; ");
+}
+
+// fallow-ignore-next-line complexity
 export function patchElementInHtml(
   source: string,
   target: SourceMutationTarget,
@@ -199,15 +283,19 @@ export function patchElementInHtml(
   const { document, wrappedFragment } = parseSourceDocument(source);
   const el = findTargetElement(document, target);
   if (!el || !isHTMLElement(el)) return { html: source, matched: false };
-  const htmlEl = el as unknown as HTMLElement;
+  const htmlEl = el;
 
   for (const op of operations) {
     switch (op.type) {
       case "inline-style":
-        if (op.value != null) {
-          htmlEl.style.setProperty(op.property, op.value);
-        } else {
-          htmlEl.style.removeProperty(op.property);
+        // linkedom's CSSStyleDeclaration does not support CSS custom properties
+        // (--foo) or newer individual transform properties (translate, rotate,
+        // scale) via style.setProperty(). Manipulate the style attribute string
+        // directly so all property names survive the round-trip.
+        {
+          const raw = htmlEl.getAttribute("style") ?? "";
+          const patched = patchStyleAttrString(raw, op.property, op.value);
+          htmlEl.setAttribute("style", patched);
         }
         break;
       case "attribute":
@@ -230,7 +318,11 @@ export function patchElementInHtml(
         }
         break;
       case "text-content":
-        if (op.value != null) htmlEl.textContent = op.value;
+        if (op.value != null) {
+          const inner = htmlEl.children.length === 1 ? htmlEl.firstElementChild : null;
+          const textTarget = inner && isHTMLElement(inner) ? inner : htmlEl;
+          textTarget.textContent = op.value;
+        }
         break;
     }
   }
@@ -254,6 +346,36 @@ export interface SplitElementResult {
   newId: string | null;
 }
 
+function resolveElementTiming(el: Element): {
+  start: number;
+  duration: number;
+  usesDataEnd: boolean;
+} {
+  const start = parseFloat(el.getAttribute("data-start") ?? "0") || 0;
+  const usesDataEnd = el.hasAttribute("data-end");
+  const duration = usesDataEnd
+    ? parseFloat(el.getAttribute("data-end") ?? "") - start || 0
+    : parseFloat(el.getAttribute("data-duration") ?? "0") || 0;
+  return { start, duration, usesDataEnd };
+}
+
+function setElementDuration(
+  el: Element,
+  start: number,
+  duration: number,
+  usesDataEnd: boolean,
+): void {
+  if (usesDataEnd) {
+    const endTime = String(Math.round((start + duration) * 1000) / 1000);
+    el.setAttribute("data-end", endTime);
+    el.removeAttribute("data-duration");
+  } else {
+    el.setAttribute("data-duration", String(Math.round(duration * 1000) / 1000));
+    el.removeAttribute("data-end");
+  }
+}
+
+// fallow-ignore-next-line complexity
 export function splitElementInHtml(
   source: string,
   target: SourceMutationTarget,
@@ -264,10 +386,17 @@ export function splitElementInHtml(
   const el = findTargetElement(document, target);
   if (!el || !isHTMLElement(el)) return { html: source, matched: false, newId: null };
 
-  const start = parseFloat(el.getAttribute("data-start") ?? "0") || 0;
-  const duration = parseFloat(el.getAttribute("data-duration") ?? "0") || 0;
+  const { start, duration, usesDataEnd } = resolveElementTiming(el);
   if (duration <= 0 || splitTime <= start || splitTime >= start + duration) {
     return { html: source, matched: false, newId: null };
+  }
+
+  if (document.getElementById(newId)) {
+    let suffix = 2;
+    const base = newId;
+    while (document.getElementById(newId)) {
+      newId = `${base}-${suffix++}`;
+    }
   }
 
   const firstDuration = splitTime - start;
@@ -275,8 +404,12 @@ export function splitElementInHtml(
 
   const clone = el.cloneNode(true) as HTMLElement;
   clone.setAttribute("id", newId);
+  clone.removeAttribute("data-hf-id");
   clone.setAttribute("data-start", String(Math.round(splitTime * 1000) / 1000));
-  clone.setAttribute("data-duration", String(Math.round(secondDuration * 1000) / 1000));
+  setElementDuration(clone, splitTime, secondDuration, usesDataEnd);
+
+  // Keep the "clip" class — the runtime uses it to control visibility
+  // based on data-start/data-duration timing.
 
   // Adjust media trim offset for the second half
   const playbackStartAttr = el.hasAttribute("data-playback-start")
@@ -286,15 +419,22 @@ export function splitElementInHtml(
       : null;
   if (playbackStartAttr) {
     const currentTrim = parseFloat(el.getAttribute(playbackStartAttr) ?? "0") || 0;
-    const rate = parseFloat(el.getAttribute("data-playback-rate") ?? "1") || 1;
+    const rateRaw = parseFloat(el.getAttribute("data-playback-rate") ?? "");
+    const rate = Number.isFinite(rateRaw) ? rateRaw : 1;
     clone.setAttribute(
       playbackStartAttr,
       String(Math.round((currentTrim + firstDuration * rate) * 1000) / 1000),
     );
   }
 
+  // Duplicate CSS rules targeting the original ID so the clone inherits the same styles.
+  const originalId = el.getAttribute("id");
+  if (originalId) {
+    duplicateCssRulesForId(document, originalId, newId);
+  }
+
   // Trim the original element's duration
-  el.setAttribute("data-duration", String(Math.round(firstDuration * 1000) / 1000));
+  setElementDuration(el, start, firstDuration, usesDataEnd);
 
   // Insert clone after original
   if (el.nextSibling) {

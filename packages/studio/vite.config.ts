@@ -180,6 +180,9 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
   },
+  optimizeDeps: {
+    include: ["bpm-detective"],
+  },
   server: {
     port: 5190,
   },
@@ -191,5 +194,8 @@ export default defineConfig({
     // instead of esbuild-transforming the `require` into a shim that throws
     // "Dynamic require of fs is not supported". Browser bundles never reach them.
     external: ["recast", "@babel/parser", "ast-types"],
+  },
+  test: {
+    exclude: ["data/**", "node_modules/**"],
   },
 });

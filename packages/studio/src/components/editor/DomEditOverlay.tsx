@@ -1,9 +1,10 @@
 import { memo, useMemo, useRef, useState, type RefObject } from "react";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { type DomEditSelection } from "./domEditing";
-import { resolveDomEditGroupOverlayRect, toOverlayRect } from "./domEditOverlayGeometry";
+import { resolveDomEditGroupOverlayRect } from "./domEditOverlayGeometry";
 import {
   type BlockedMoveState,
+  type DomEditGroupPathOffsetCommit,
   type FocusableDomEditOverlay,
   type GestureState,
   type GroupGestureState,
@@ -13,6 +14,7 @@ import { useDomEditOverlayRects } from "./useDomEditOverlayRects";
 import { createDomEditOverlayGestureHandlers } from "./useDomEditOverlayGestures";
 import { SnapGuideOverlay, type SnapGuidesState } from "./SnapGuideOverlay";
 import { GridOverlay } from "./GridOverlay";
+import { GestureRecordBadge, type GestureRecordingState } from "./GestureRecordControl";
 
 // Re-exports for external consumers — preserving existing import paths.
 export {
@@ -26,11 +28,7 @@ export {
   resolveDomEditResizeGesture,
   resolveDomEditRotationGesture,
 } from "./domEditOverlayGestures";
-
-export interface DomEditGroupPathOffsetCommit {
-  selection: DomEditSelection;
-  next: { x: number; y: number };
-}
+export type { DomEditGroupPathOffsetCommit } from "./domEditOverlayGestures";
 
 interface DomEditOverlayProps {
   iframeRef: RefObject<HTMLIFrameElement | null>;
@@ -66,6 +64,8 @@ interface DomEditOverlayProps {
   onRotationCommit: (selection: DomEditSelection, next: { angle: number }) => Promise<void> | void;
   gridVisible?: boolean;
   gridSpacing?: number;
+  recordingState?: GestureRecordingState;
+  onToggleRecording?: () => void;
 }
 
 export const DomEditOverlay = memo(function DomEditOverlay({
@@ -87,9 +87,34 @@ export const DomEditOverlay = memo(function DomEditOverlay({
   onGroupPathOffsetCommit,
   onBoxSizeCommit,
   onRotationCommit,
+  recordingState,
+  onToggleRecording,
 }: DomEditOverlayProps) {
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
+
+  const selectionShapeStyles = (() => {
+    const fallback = {
+      borderRadius: 4 as string | number,
+      clipPath: undefined as string | undefined,
+    };
+    if (!selection?.element) return fallback;
+    try {
+      const tag = selection.element.tagName.toLowerCase();
+      if (tag === "svg" || tag === "img" || tag === "video" || tag === "canvas") return fallback;
+      const win = selection.element.ownerDocument.defaultView;
+      if (!win) return fallback;
+      const cs = win.getComputedStyle(selection.element);
+      const br = cs.borderRadius;
+      const cp = cs.clipPath;
+      return {
+        borderRadius: br && br !== "0px" ? br : 4,
+        clipPath: cp && cp !== "none" ? cp : undefined,
+      };
+    } catch {
+      return fallback;
+    }
+  })();
   const gestureRef = useRef<GestureState | null>(null);
   const groupGestureRef = useRef<GroupGestureState | null>(null);
   const blockedMoveRef = useRef<BlockedMoveState | null>(null);
@@ -134,6 +159,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     groupOverlayItems,
     groupOverlayItemsRef,
     setGroupOverlayItems,
+    childRects,
   } = useDomEditOverlayRects({
     iframeRef,
     overlayRef,
@@ -228,6 +254,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     groupOverlayItems.every((item) => item.selection.capabilities.canApplyManualOffset);
 
   const handleOverlayMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!allowCanvasMovement) return;
     if (suppressNextOverlayMouseDownRef.current) {
       suppressNextOverlayMouseDownRef.current = false;
       suppressNextBoxMouseDownRef.current = false;
@@ -238,6 +265,22 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     }
     const target = event.target as HTMLElement | null;
     if (target?.closest('[data-dom-edit-selection-box="true"]')) return;
+    // Don't re-resolve selection when clicking outside the composition bounds —
+    // the iframe can't resolve elements there, so it would clear the selection.
+    if (selection && compRect.width > 0) {
+      const overlayEl = overlayRef.current;
+      if (overlayEl) {
+        const overlayRect = overlayEl.getBoundingClientRect();
+        const clickX = event.clientX - overlayRect.left;
+        const clickY = event.clientY - overlayRect.top;
+        const outsideComp =
+          clickX < compRect.left ||
+          clickX > compRect.left + compRect.width ||
+          clickY < compRect.top ||
+          clickY > compRect.top + compRect.height;
+        if (outsideComp) return;
+      }
+    }
     onCanvasMouseDown(event, { preferClipAncestor: false });
     if (event.shiftKey) {
       suppressNextBoxMouseDownRef.current = true;
@@ -263,31 +306,10 @@ export const DomEditOverlay = memo(function DomEditOverlay({
 
     const target = event.target as HTMLElement | null;
     if (target?.closest('[data-dom-edit-selection-box="true"]')) return;
-
-    const candidate = hoverSelectionRef.current;
-    if (!candidate?.capabilities.canApplyManualOffset) return;
-
-    const overlayEl = overlayRef.current;
-    const iframe = iframeRef.current;
-    const candidateRect =
-      overlayEl && iframe ? toOverlayRect(overlayEl, iframe, candidate.element) : null;
-    if (!candidateRect) return;
-
-    suppressNextOverlayMouseDownRef.current = true;
-    selectionRef.current = candidate;
-    setOverlayRect(candidateRect);
-    const didStartGesture = gestures.startGesture("drag", event, {
-      selection: candidate,
-      rect: candidateRect,
-    });
-    if (!didStartGesture) {
-      suppressNextOverlayMouseDownRef.current = false;
-      return;
-    }
-    onSelectionChangeRef.current(candidate);
   };
 
   const handleBoxClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!allowCanvasMovement) return;
     if (gestureRef.current || groupGestureRef.current) return;
     if (suppressNextBoxClickRef.current) {
       suppressNextBoxClickRef.current = false;
@@ -320,20 +342,37 @@ export const DomEditOverlay = memo(function DomEditOverlay({
       onPointerUp={gestures.onPointerUp}
       onPointerCancel={() => gestures.clearPointerState(selectionRef)}
     >
-      {hoverSelection && hoverRect && (
+      {hoverSelection && hoverRect && compRect.width > 0 && (
         <div
           aria-hidden="true"
           data-dom-edit-hover-box="true"
-          className="pointer-events-none absolute rounded-xl border border-studio-accent/80 bg-studio-accent/5 shadow-[0_0_0_1px_rgba(60,230,172,0.25)]"
-          style={{
-            left: hoverRect.left,
-            top: hoverRect.top,
-            width: hoverRect.width,
-            height: hoverRect.height,
-          }}
+          className="pointer-events-none absolute border border-studio-accent/80 bg-studio-accent/5 shadow-[0_0_0_1px_rgba(60,230,172,0.25)]"
+          style={(() => {
+            let br: string | number = 4;
+            let cp: string | undefined;
+            try {
+              const el = hoverSelection.element;
+              const tag = el.tagName.toLowerCase();
+              if (tag !== "svg" && tag !== "img" && tag !== "video" && tag !== "canvas") {
+                const cs = el.ownerDocument.defaultView?.getComputedStyle(el);
+                if (cs?.borderRadius && cs.borderRadius !== "0px") br = cs.borderRadius;
+                if (cs?.clipPath && cs.clipPath !== "none") cp = cs.clipPath;
+              }
+            } catch {
+              /* cross-origin guard */
+            }
+            return {
+              left: hoverRect.left,
+              top: hoverRect.top,
+              width: hoverRect.width,
+              height: hoverRect.height,
+              borderRadius: br,
+              clipPath: cp,
+            };
+          })()}
         />
       )}
-      {hasGroupSelection && groupOverlayItems.length > 1 && groupBounds && (
+      {hasGroupSelection && groupOverlayItems.length > 1 && groupBounds && compRect.width > 0 && (
         <>
           {groupOverlayItems.map((item) => (
             <div
@@ -367,7 +406,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
           />
         </>
       )}
-      {!hasGroupSelection && selection && overlayRect && (
+      {!hasGroupSelection && selection && overlayRect && compRect.width > 0 && (
         <>
           {allowCanvasMovement && selection.capabilities.canApplyManualRotation && (
             <div
@@ -394,16 +433,25 @@ export const DomEditOverlay = memo(function DomEditOverlay({
               />
             </div>
           )}
+          {onToggleRecording && (
+            <GestureRecordBadge
+              rect={overlayRect}
+              recordingState={recordingState}
+              onToggleRecording={onToggleRecording}
+            />
+          )}
           <div
             key={selectionKey}
             ref={boxRef}
             data-dom-edit-selection-box="true"
-            className="pointer-events-auto absolute rounded-xl border border-studio-accent/80 bg-studio-accent/5 shadow-[0_0_0_1px_rgba(60,230,172,0.25)]"
+            className={`pointer-events-auto absolute ${selectionShapeStyles.clipPath ? "shadow-[inset_0_0_0_2px_rgba(60,230,172,0.6)]" : "border border-studio-accent/80 shadow-[0_0_0_1px_rgba(60,230,172,0.25)]"} bg-studio-accent/5`}
             style={{
               left: overlayRect.left,
               top: overlayRect.top,
               width: overlayRect.width,
               height: overlayRect.height,
+              borderRadius: selectionShapeStyles.borderRadius,
+              clipPath: selectionShapeStyles.clipPath,
               cursor:
                 allowCanvasMovement && selection.capabilities.canApplyManualOffset
                   ? "move"
@@ -441,6 +489,20 @@ export const DomEditOverlay = memo(function DomEditOverlay({
           </div>
         </>
       )}
+      {childRects.length > 0 &&
+        compRect.width > 0 &&
+        childRects.map((cr, i) => (
+          <div
+            key={i}
+            className="pointer-events-none absolute border border-dashed border-white/20 rounded-sm"
+            style={{
+              left: cr.left,
+              top: cr.top,
+              width: cr.width,
+              height: cr.height,
+            }}
+          />
+        ))}
       <GridOverlay
         visible={gridVisible}
         spacing={gridSpacing}

@@ -32,6 +32,7 @@ import {
 } from "./manualEditsTypes";
 import { roundRotationAngle } from "./manualEditsParsing";
 import { applyStudioMotionFromDom } from "./studioMotion";
+import { gsapAnimatesProperty } from "./gsapAnimatesProperty";
 
 /* ── Gesture tracking ─────────────────────────────────────────────── */
 let studioManualEditGestureId = 0;
@@ -273,11 +274,45 @@ export function applyStudioPathOffsetDraft(
 ): void {
   promoteInlineForTransform(element);
   writeStudioPathOffsetVars(element, offset, { updateBase: false });
-  element.style.setProperty(
-    "translate",
-    composeTranslateValue(element, `${Math.round(offset.x)}px`, `${Math.round(offset.y)}px`),
-  );
-  stripGsapTranslateFromTransform(element);
+
+  const isGsapAnimated = gsapAnimatesProperty(element, "x", "y");
+  if (isGsapAnimated) {
+    element.style.setProperty("translate", "none");
+    const win = element.ownerDocument.defaultView as
+      | (Window & {
+          gsap?: {
+            set: (el: Element, vars: Record<string, unknown>) => void;
+            getProperty: (el: Element, prop: string) => number;
+          };
+        })
+      | null;
+    if (win?.gsap) {
+      const baseX = Number.parseFloat(element.getAttribute("data-hf-drag-gsap-base-x") ?? "");
+      const baseY = Number.parseFloat(element.getAttribute("data-hf-drag-gsap-base-y") ?? "");
+      const origX = Number.parseFloat(element.getAttribute("data-hf-drag-initial-offset-x") ?? "");
+      const origY = Number.parseFloat(element.getAttribute("data-hf-drag-initial-offset-y") ?? "");
+      const gsapBaseX = Number.isFinite(baseX)
+        ? baseX
+        : (win.gsap.getProperty(element, "x") as number);
+      const gsapBaseY = Number.isFinite(baseY)
+        ? baseY
+        : (win.gsap.getProperty(element, "y") as number);
+      if (!Number.isFinite(baseX))
+        element.setAttribute("data-hf-drag-gsap-base-x", String(gsapBaseX));
+      if (!Number.isFinite(baseY))
+        element.setAttribute("data-hf-drag-gsap-base-y", String(gsapBaseY));
+      const deltaX = offset.x - (Number.isFinite(origX) ? origX : 0);
+      const deltaY = offset.y - (Number.isFinite(origY) ? origY : 0);
+      win.gsap.set(element, { x: gsapBaseX + deltaX, y: gsapBaseY + deltaY });
+    }
+  } else {
+    // Non-GSAP elements: use CSS translate as before.
+    element.style.setProperty(
+      "translate",
+      composeTranslateValue(element, `${Math.round(offset.x)}px`, `${Math.round(offset.y)}px`),
+    );
+    stripGsapTranslateFromTransform(element);
+  }
 }
 
 /* ── Box size apply ───────────────────────────────────────────────── */
@@ -471,18 +506,6 @@ export function applyStudioRotationDraft(element: HTMLElement, rotation: { angle
   );
 }
 
-/* ── HTML patch builders (re-exported from manualEditsDomPatches) ── */
-export {
-  buildPathOffsetPatches,
-  buildClearPathOffsetPatches,
-  buildBoxSizePatches,
-  buildClearBoxSizePatches,
-  buildRotationPatches,
-  buildClearRotationPatches,
-  buildMotionPatches,
-  buildClearMotionPatches,
-} from "./manualEditsDomPatches";
-
 /* ── Seek reapply (position + motion) ────────────────────────────── */
 
 function queryStudioElements(doc: Document, attr: string): HTMLElement[] {
@@ -505,64 +528,21 @@ function queryStudioElements(doc: Document, attr: string): HTMLElement[] {
 
 function reapplyPathOffsets(doc: Document): void {
   for (const el of queryStudioElements(doc, STUDIO_PATH_OFFSET_ATTR)) {
+    const gsapSkip = gsapAnimatesProperty(el, "x", "y");
     const x = el.style.getPropertyValue(STUDIO_OFFSET_X_PROP);
     const y = el.style.getPropertyValue(STUDIO_OFFSET_Y_PROP);
+    if (gsapSkip) continue;
     if (x || y) {
-      applyStudioPathOffset(el, {
-        x: Number.parseFloat(x) || 0,
-        y: Number.parseFloat(y) || 0,
-      });
+      applyStudioPathOffset(
+        el,
+        {
+          x: Number.parseFloat(x) || 0,
+          y: Number.parseFloat(y) || 0,
+        },
+        { updateBase: false },
+      );
     }
   }
-}
-
-function gsapAnimatesProperty(el: HTMLElement, ...props: string[]): boolean {
-  const win = el.ownerDocument.defaultView as
-    | (Window & {
-        __timelines?: Record<
-          string,
-          {
-            getChildren?: (
-              deep: boolean,
-            ) => Array<{ targets?: () => Element[]; vars?: Record<string, unknown> }>;
-          }
-        >;
-      })
-    | null;
-  if (!win?.__timelines) return false;
-  const propSet = new Set(props);
-  for (const tl of Object.values(win.__timelines)) {
-    if (!tl?.getChildren) continue;
-    try {
-      for (const child of tl.getChildren(true)) {
-        if (!child.targets || !child.vars) continue;
-        let targetsEl = false;
-        for (const t of child.targets()) {
-          if (t === el || (el.id && t.id === el.id)) {
-            targetsEl = true;
-            break;
-          }
-        }
-        if (!targetsEl) continue;
-        const vars = child.vars;
-        for (const p of propSet) {
-          if (p in vars) return true;
-        }
-        if (vars.keyframes && typeof vars.keyframes === "object") {
-          for (const kfVal of Object.values(vars.keyframes as Record<string, unknown>)) {
-            if (kfVal && typeof kfVal === "object") {
-              for (const p of propSet) {
-                if (p in (kfVal as Record<string, unknown>)) return true;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      /* */
-    }
-  }
-  return false;
 }
 
 function reapplyBoxSizes(doc: Document): void {

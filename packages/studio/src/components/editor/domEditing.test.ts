@@ -431,6 +431,90 @@ describe("resolveDomEditSelection", () => {
     });
   });
 
+  it("keeps the full-canvas stage layer transform disabled while allowing style edits", async () => {
+    const document = createDocument(`
+      <div data-hf-id="hf-stage" id="stage">
+        <button id="cta">Add to basket</button>
+      </div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const stage = document.getElementById("stage") as HTMLElement;
+    setElementRect(stage, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(stage, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("stage");
+    expect(selection?.capabilities).toMatchObject({
+      canSelect: true,
+      canEditStyles: true,
+      canMove: false,
+      canResize: false,
+      canApplyManualOffset: false,
+      canApplyManualSize: false,
+      canApplyManualRotation: false,
+      reasonIfDisabled: "The root composition defines the preview bounds.",
+    });
+  });
+
+  it("keeps direct full-bleed absolute layers editable", async () => {
+    const document = createDocument(`
+      <div id="hero" style="position: absolute; left: 0; top: 0; width: 1920px; height: 1080px;"></div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const hero = document.getElementById("hero") as HTMLElement;
+    setElementRect(hero, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(hero, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("hero");
+    expect(selection?.capabilities).toMatchObject({
+      canSelect: true,
+      canEditStyles: true,
+      canMove: true,
+      canResize: true,
+      canApplyManualOffset: true,
+      canApplyManualSize: true,
+      canApplyManualRotation: true,
+    });
+  });
+
+  it("lets full-canvas layers opt out of root-layer classification", async () => {
+    const document = createDocument(`
+      <div data-hf-allow-root-edit id="editable-stage">
+        <button id="cta">Add to basket</button>
+      </div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const editableStage = document.getElementById("editable-stage") as HTMLElement;
+    setElementRect(editableStage, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(editableStage, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("editable-stage");
+    expect(selection?.capabilities.canApplyManualOffset).toBe(true);
+  });
+
   it("resolves child clicks inside a composition host to the child in master view", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
@@ -1154,5 +1238,48 @@ describe("patch builders and prompt builder", () => {
         isMasterView: false,
       }),
     ).not.toThrow();
+  });
+});
+
+describe("hfId — find, key, capabilities (R7 fixes)", () => {
+  it("getDomEditTargetKey keeps two hfId-only elements distinct", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const a = getDomEditTargetKey({ sourceFile: "index.html", hfId: "hf-aaa" } as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const b = getDomEditTargetKey({ sourceFile: "index.html", hfId: "hf-bbb" } as any);
+    expect(a).not.toBe(b);
+  });
+
+  it("findElementForSelection finds element by data-hf-id when no id or selector", () => {
+    const doc = createDocument(`
+      <div data-composition-id="root">
+        <div data-hf-id="hf-xyz789" class="clip" style="position:absolute;left:0;top:0;width:100px;height:100px;"></div>
+      </div>
+    `);
+    const el = doc.querySelector('[data-hf-id="hf-xyz789"]') as HTMLElement;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const found = findElementForSelection(doc, { hfId: "hf-xyz789" } as any);
+    expect(found).toBe(el);
+  });
+
+  it("resolveDomEditCapabilities enables editing for hfId-only element (no CSS selector)", () => {
+    const result = resolveDomEditCapabilities({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      hfId: "hf-abc" as any,
+      selector: undefined,
+      inlineStyles: { left: "10px", top: "20px", width: "100px", height: "50px" },
+      computedStyles: {
+        position: "absolute",
+        left: "10px",
+        top: "20px",
+        width: "100px",
+        height: "50px",
+      },
+      isCompositionHost: false,
+      isInsideLockedComposition: false,
+      isMasterView: false,
+    });
+    expect(result.canSelect).toBe(true);
+    expect(result.canMove).toBe(true);
   });
 });

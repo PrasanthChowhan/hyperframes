@@ -16,9 +16,23 @@ import {
   updateKeyframeInScript,
   convertToKeyframesInScript,
   removeAllKeyframesFromScript,
+  addAnimationWithKeyframesToScript,
+  splitAnimationsInScript,
+  splitIntoPropertyGroups,
+  shiftPositionsInScript,
+  scalePositionsInScript,
 } from "./gsapParser.js";
 import type { GsapAnimation } from "./gsapParser.js";
+import { classifyPropertyGroup, classifyTweenPropertyGroup } from "./gsapConstants.js";
 import type { Keyframe } from "../core.types";
+import {
+  parseAndSerialize,
+  parseSingleAnimation,
+  expectKeyframe,
+  expectKeyframesFormat,
+  convertAndReparse,
+  parseSplitAndAssert,
+} from "./gsapParser.test-helpers.js";
 
 describe("parseGsapScript", () => {
   it("parses a basic timeline with .to()", () => {
@@ -250,8 +264,8 @@ describe("parseGsapScript", () => {
     expect(result1.animations[1].id).toBe(result2.animations[1].id);
 
     // IDs encode selector, method, and position
-    expect(result1.animations[0].id).toBe("#el1-to-0");
-    expect(result1.animations[1].id).toBe("#el2-to-1000");
+    expect(result1.animations[0].id).toBe("#el1-to-0-visual");
+    expect(result1.animations[1].id).toBe("#el2-to-1000-position");
   });
 
   it("disambiguates colliding IDs with a suffix", () => {
@@ -262,8 +276,8 @@ describe("parseGsapScript", () => {
     `;
     const result = parseGsapScript(script);
 
-    expect(result.animations[0].id).toBe("#el1-to-0");
-    expect(result.animations[1].id).toBe("#el1-to-0-2");
+    expect(result.animations[0].id).toBe("#el1-to-0-visual");
+    expect(result.animations[1].id).toBe("#el1-to-0-visual-2");
   });
 
   it("uses string position in ID for relative positions", () => {
@@ -273,7 +287,219 @@ describe("parseGsapScript", () => {
     `;
     const result = parseGsapScript(script);
 
-    expect(result.animations[0].id).toBe("#el1-to-+=1");
+    expect(result.animations[0].id).toBe("#el1-to-+=1-visual");
+  });
+});
+
+describe("resolvedStart — timeline position resolution", () => {
+  it("resolves chained from() tweens with relative positions (sdk-test pattern)", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { ease: "power3.out" } });
+      tl.from("#headline", { duration: 0.6, scale: 0.92, transformOrigin: "left center" })
+        .from("#subtext",  { duration: 0.5, scale: 0.92, transformOrigin: "left center" }, "-=0.3")
+        .from("#box",      { duration: 0.5, scale: 0.5,  transformOrigin: "center center" }, "-=0.3");
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations).toHaveLength(3);
+    // Execution order: #headline, #subtext, #box
+    expect(result.animations[0].targetSelector).toBe("#headline");
+    expect(result.animations[1].targetSelector).toBe("#subtext");
+    expect(result.animations[2].targetSelector).toBe("#box");
+
+    // #headline: implicit position → starts at 0, ends at 0.6
+    expect(result.animations[0].resolvedStart).toBe(0);
+    expect(result.animations[0].implicitPosition).toBe(true);
+
+    // #subtext: "-=0.3" from cursor (0.6) → 0.6 - 0.3 = 0.3
+    expect(result.animations[1].resolvedStart).toBe(0.3);
+
+    // #box: "-=0.3" from cursor (max(0.6, 0.3+0.5=0.8) = 0.8) → 0.8 - 0.3 = 0.5
+    expect(result.animations[2].resolvedStart).toBe(0.5);
+  });
+
+  it("resolves += and < positions", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el1", { opacity: 1, duration: 0.5 }, "+=1");
+      tl.to("#el2", { x: 100, duration: 1 }, "<");
+      tl.to("#el3", { y: 50, duration: 0.3 }, "-=0.5");
+    `;
+    const result = parseGsapScript(script);
+
+    // #el1: "+=1" from cursor (0) → 0 + 1 = 1, ends at 1.5
+    expect(result.animations[0].resolvedStart).toBe(1);
+
+    // #el2: "<" = previous start → 1
+    expect(result.animations[1].resolvedStart).toBe(1);
+
+    // #el3: "-=0.5" from cursor (max(1.5, 1+1=2) = 2) → 2 - 0.5 = 1.5
+    expect(result.animations[2].resolvedStart).toBe(1.5);
+  });
+
+  it("resolves numeric positions directly", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el1", { opacity: 1, duration: 0.5 }, 0);
+      tl.to("#el2", { x: 100, duration: 1 }, 2);
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations[0].resolvedStart).toBe(0);
+    expect(result.animations[1].resolvedStart).toBe(2);
+  });
+
+  it("resolves implicit sequential positions", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el1", { opacity: 1, duration: 0.5 })
+        .to("#el2", { x: 100, duration: 1 })
+        .to("#el3", { y: 50, duration: 0.3 });
+    `;
+    const result = parseGsapScript(script);
+
+    // #el1: implicit → cursor=0, ends at 0.5
+    expect(result.animations[0].resolvedStart).toBe(0);
+    expect(result.animations[0].implicitPosition).toBe(true);
+
+    // #el2: implicit → cursor=0.5, ends at 1.5
+    expect(result.animations[1].resolvedStart).toBe(0.5);
+    expect(result.animations[1].implicitPosition).toBe(true);
+
+    // #el3: implicit → cursor=1.5, ends at 1.8
+    expect(result.animations[2].resolvedStart).toBe(1.5);
+    expect(result.animations[2].implicitPosition).toBe(true);
+  });
+
+  it("clamps negative resolvedStart to 0", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el1", { opacity: 1, duration: 0.2 });
+      tl.to("#el2", { x: 100, duration: 1 }, "-=5");
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations[1].resolvedStart).toBe(0);
+  });
+
+  it("uses GSAP default duration (0.5) for tweens with no explicit duration", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el1", { opacity: 1 })
+        .to("#el2", { x: 100 });
+    `;
+    const result = parseGsapScript(script);
+
+    // #el1: starts at 0, duration defaults to 0.5 → cursor at 0.5
+    expect(result.animations[0].resolvedStart).toBe(0);
+    // #el2: starts at cursor = 0.5
+    expect(result.animations[1].resolvedStart).toBe(0.5);
+  });
+
+  it("treats set() as zero-duration", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.set("#el1", { opacity: 0 });
+      tl.to("#el2", { opacity: 1, duration: 1 });
+    `;
+    const result = parseGsapScript(script);
+
+    // set() at 0, zero duration → cursor stays at 0
+    expect(result.animations[0].resolvedStart).toBe(0);
+    // next tween starts at cursor = 0
+    expect(result.animations[1].resolvedStart).toBe(0);
+  });
+});
+
+describe("timeline defaults inheritance", () => {
+  it("inherits ease and duration from timeline defaults onto tweens", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { ease: "power3.out", duration: 0.6 } });
+      tl.from("#headline", { scale: 0.92, transformOrigin: "left center" })
+        .from("#subtext", { scale: 0.92 }, "-=0.3");
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations[0].ease).toBe("power3.out");
+    expect(result.animations[0].duration).toBe(0.6);
+    expect(result.animations[1].ease).toBe("power3.out");
+    expect(result.animations[1].duration).toBe(0.6);
+  });
+
+  it("does not override explicit ease/duration on individual tweens", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { ease: "power3.out", duration: 0.6 } });
+      tl.to("#el1", { opacity: 1, duration: 1, ease: "none" });
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations[0].ease).toBe("none");
+    expect(result.animations[0].duration).toBe(1);
+  });
+
+  it("uses inherited duration for position resolution", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { duration: 0.8 } });
+      tl.from("#a", { scale: 0.5 })
+        .from("#b", { scale: 0.5 });
+    `;
+    const result = parseGsapScript(script);
+
+    // #a starts at 0, duration 0.8 → cursor at 0.8
+    expect(result.animations[0].resolvedStart).toBe(0);
+    // #b starts at cursor = 0.8
+    expect(result.animations[1].resolvedStart).toBe(0.8);
+  });
+});
+
+describe("property group classification", () => {
+  it("classifies individual properties into groups", () => {
+    expect(classifyPropertyGroup("x")).toBe("position");
+    expect(classifyPropertyGroup("y")).toBe("position");
+    expect(classifyPropertyGroup("xPercent")).toBe("position");
+    expect(classifyPropertyGroup("scale")).toBe("scale");
+    expect(classifyPropertyGroup("scaleX")).toBe("scale");
+    expect(classifyPropertyGroup("width")).toBe("size");
+    expect(classifyPropertyGroup("height")).toBe("size");
+    expect(classifyPropertyGroup("rotation")).toBe("rotation");
+    expect(classifyPropertyGroup("skewX")).toBe("rotation");
+    expect(classifyPropertyGroup("opacity")).toBe("visual");
+    expect(classifyPropertyGroup("autoAlpha")).toBe("visual");
+    expect(classifyPropertyGroup("borderRadius")).toBe("other");
+    expect(classifyPropertyGroup("fontSize")).toBe("other");
+  });
+
+  it("classifies a pure position tween", () => {
+    expect(classifyTweenPropertyGroup({ x: 100, y: 50 })).toBe("position");
+  });
+
+  it("classifies a pure scale tween", () => {
+    expect(classifyTweenPropertyGroup({ scale: 0.5 })).toBe("scale");
+  });
+
+  it("classifies scale + transformOrigin as scale (transformOrigin follows group)", () => {
+    expect(classifyTweenPropertyGroup({ scale: 0.5, transformOrigin: "center center" })).toBe(
+      "scale",
+    );
+  });
+
+  it("returns undefined for mixed-group tweens", () => {
+    expect(classifyTweenPropertyGroup({ x: 100, scale: 0.5 })).toBeUndefined();
+    expect(classifyTweenPropertyGroup({ x: 100, opacity: 0 })).toBeUndefined();
+  });
+
+  it("classifies tweens during parsing", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#a", { x: 100, y: 50, duration: 1 }, 0);
+      tl.to("#b", { scale: 0.5, duration: 0.5 }, 0);
+      tl.to("#c", { x: 100, scale: 0.5, opacity: 0, duration: 1 }, 0);
+    `;
+    const result = parseGsapScript(script);
+
+    expect(result.animations[0].propertyGroup).toBe("position");
+    expect(result.animations[1].propertyGroup).toBe("scale");
+    expect(result.animations[2].propertyGroup).toBeUndefined();
   });
 });
 
@@ -298,11 +524,7 @@ describe("stagger/yoyo/repeat round-trip", () => {
       const tl = gsap.timeline({ paused: true });
       tl.to(".items", { opacity: 1, duration: 0.5, stagger: { each: 0.15, from: "start" } }, 0);
     `;
-    const parsed = parseGsapScript(script);
-    const serialized = serializeGsapAnimations(parsed.animations, parsed.timelineVar, {
-      preamble: parsed.preamble,
-      postamble: parsed.postamble,
-    });
+    const { serialized } = parseAndSerialize(script);
 
     expect(serialized).toContain("stagger: {");
     expect(serialized).toContain("each: 0.15");
@@ -314,11 +536,7 @@ describe("stagger/yoyo/repeat round-trip", () => {
       const tl = gsap.timeline({ paused: true });
       tl.to("#el1", { x: 100, duration: 1, yoyo: true, repeat: 3, repeatDelay: 0.2 }, 0);
     `;
-    const parsed = parseGsapScript(script);
-    const serialized = serializeGsapAnimations(parsed.animations, parsed.timelineVar, {
-      preamble: parsed.preamble,
-      postamble: parsed.postamble,
-    });
+    const { serialized } = parseAndSerialize(script);
 
     expect(serialized).toContain("yoyo: true");
     expect(serialized).toContain("repeat: 3");
@@ -348,11 +566,7 @@ describe("unresolvable value round-trip", () => {
       const tl = gsap.timeline({ paused: true });
       tl.to("#el1", { opacity: someFn(), x: 50, duration: 1 }, 0);
     `;
-    const parsed = parseGsapScript(script);
-    const serialized = serializeGsapAnimations(parsed.animations, parsed.timelineVar, {
-      preamble: parsed.preamble,
-      postamble: parsed.postamble,
-    });
+    const { serialized } = parseAndSerialize(script);
 
     // The raw expression should survive — emitted without quotes
     expect(serialized).toContain("opacity: someFn()");
@@ -1100,9 +1314,8 @@ describe("gsap.utils.toArray targets", () => {
       const tl = gsap.timeline({ paused: true });
       tl.to(gsap.utils.toArray(".item"), { opacity: 1, duration: 0.5, stagger: 0.1 }, 0);
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations).toHaveLength(1);
-    expect(result.animations[0].targetSelector).toBe(".item");
+    const anim = parseSingleAnimation(script);
+    expect(anim.targetSelector).toBe(".item");
   });
 
   it("resolves a toArray result stored in a variable", () => {
@@ -1111,8 +1324,8 @@ describe("gsap.utils.toArray targets", () => {
       const tl = gsap.timeline({ paused: true });
       tl.to(items, { opacity: 1, duration: 0.5 }, 0);
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations[0].targetSelector).toBe(".item");
+    const anim = parseSingleAnimation(script);
+    expect(anim.targetSelector).toBe(".item");
   });
 });
 
@@ -1146,9 +1359,8 @@ describe("forEach / map callback targets", () => {
         tl.to(el, { opacity: 1, duration: 0.4 }, 0);
       });
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations).toHaveLength(1);
-    expect(result.animations[0].targetSelector).toBe(".item");
+    const anim = parseSingleAnimation(script);
+    expect(anim.targetSelector).toBe(".item");
   });
 
   it("resolves an inline querySelectorAll().forEach callback param", () => {
@@ -1158,8 +1370,8 @@ describe("forEach / map callback targets", () => {
         tl.to(dot, { scale: 1, duration: 0.3 }, 0);
       });
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations[0].targetSelector).toBe(".dot");
+    const anim = parseSingleAnimation(script);
+    expect(anim.targetSelector).toBe(".dot");
   });
 });
 
@@ -1204,23 +1416,12 @@ describe("native GSAP keyframes parsing", () => {
         duration: 5
       }, 0);
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations).toHaveLength(1);
-    const anim = result.animations[0];
-    expect(anim.keyframes).toBeDefined();
-    expect(anim.keyframes!.format).toBe("percentage");
-    expect(anim.keyframes!.keyframes).toHaveLength(3);
+    const anim = parseSingleAnimation(script);
+    const kfs = expectKeyframesFormat(anim, "percentage", 3);
 
-    expect(anim.keyframes!.keyframes[0].percentage).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.x).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.opacity).toBe(1);
-
-    expect(anim.keyframes!.keyframes[1].percentage).toBe(50);
-    expect(anim.keyframes!.keyframes[1].properties.x).toBe(100);
-    expect(anim.keyframes!.keyframes[1].ease).toBe("power2.out");
-
-    expect(anim.keyframes!.keyframes[2].percentage).toBe(100);
-    expect(anim.keyframes!.keyframes[2].properties.x).toBe(200);
+    expectKeyframe(kfs[0], 0, { x: 0, opacity: 1 });
+    expectKeyframe(kfs[1], 50, { x: 100 }, "power2.out");
+    expectKeyframe(kfs[2], 100, { x: 200 });
   });
 
   it("parses object array keyframes format", () => {
@@ -1234,26 +1435,16 @@ describe("native GSAP keyframes parsing", () => {
         ]
       }, 0);
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations).toHaveLength(1);
-    const anim = result.animations[0];
-    expect(anim.keyframes).toBeDefined();
-    expect(anim.keyframes!.format).toBe("object-array");
-    expect(anim.keyframes!.keyframes).toHaveLength(3);
+    const anim = parseSingleAnimation(script);
+    const kfs = expectKeyframesFormat(anim, "object-array", 3);
 
     // Total duration = 0.5 + 1 + 0.8 = 2.3
-    expect(anim.keyframes!.keyframes[0].percentage).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.x).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.opacity).toBe(1);
-
-    // Second: cumulative = 0.5, pct = round(0.5/2.3 * 100) = 22
-    expect(anim.keyframes!.keyframes[1].percentage).toBe(22);
-    expect(anim.keyframes!.keyframes[1].properties.x).toBe(100);
-    expect(anim.keyframes!.keyframes[1].ease).toBe("power2.out");
-
-    // Third: cumulative = 1.5, pct = round(1.5/2.3 * 100) = 65
-    expect(anim.keyframes!.keyframes[2].percentage).toBe(65);
-    expect(anim.keyframes!.keyframes[2].properties.x).toBe(200);
+    // First: cumulative = 0.5, pct = round(0.5/2.3 * 100) = 22
+    expectKeyframe(kfs[0], 22, { x: 0, opacity: 1 });
+    // Second: cumulative = 1.5, pct = round(1.5/2.3 * 100) = 65
+    expectKeyframe(kfs[1], 65, { x: 100 }, "power2.out");
+    // Third: cumulative = 2.3, pct = round(2.3/2.3 * 100) = 100
+    expectKeyframe(kfs[2], 100, { x: 200 });
   });
 
   it("parses simple array keyframes format", () => {
@@ -1264,30 +1455,17 @@ describe("native GSAP keyframes parsing", () => {
         duration: 5
       }, 0);
     `;
-    const result = parseGsapScript(script);
-    expect(result.animations).toHaveLength(1);
-    const anim = result.animations[0];
+    const anim = parseSingleAnimation(script);
     expect(anim.keyframes).toBeDefined();
     expect(anim.keyframes!.format).toBe("simple-array");
     expect(anim.keyframes!.easeEach).toBe("power2.inOut");
     expect(anim.keyframes!.keyframes).toHaveLength(4);
 
     // Evenly spaced: 0%, 33%, 67%, 100%
-    expect(anim.keyframes!.keyframes[0].percentage).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.x).toBe(0);
-    expect(anim.keyframes!.keyframes[0].properties.opacity).toBe(0);
-
-    expect(anim.keyframes!.keyframes[1].percentage).toBe(33);
-    expect(anim.keyframes!.keyframes[1].properties.x).toBe(100);
-    expect(anim.keyframes!.keyframes[1].properties.opacity).toBe(1);
-
-    expect(anim.keyframes!.keyframes[2].percentage).toBe(67);
-    expect(anim.keyframes!.keyframes[2].properties.x).toBe(200);
-    expect(anim.keyframes!.keyframes[2].properties.opacity).toBe(1);
-
-    expect(anim.keyframes!.keyframes[3].percentage).toBe(100);
-    expect(anim.keyframes!.keyframes[3].properties.x).toBe(0);
-    expect(anim.keyframes!.keyframes[3].properties.opacity).toBe(0);
+    expectKeyframe(anim.keyframes!.keyframes[0], 0, { x: 0, opacity: 0 });
+    expectKeyframe(anim.keyframes!.keyframes[1], 33, { x: 100, opacity: 1 });
+    expectKeyframe(anim.keyframes!.keyframes[2], 67, { x: 200, opacity: 1 });
+    expectKeyframe(anim.keyframes!.keyframes[3], 100, { x: 0, opacity: 0 });
   });
 
   it("parses three-level easing", () => {
@@ -1382,6 +1560,95 @@ describe("keyframe mutations", () => {
     expect(kfs[1].properties.x).toBe(999);
   });
 
+  // ── _auto endpoint updates ────────────────────────────────────────────
+
+  const AUTO_SCRIPT = `
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#hero", {
+      keyframes: { "0%": { x: 0, y: 0, _auto: 1 }, "100%": { x: 200, y: 100, _auto: 1 } },
+      duration: 2
+    }, 0);
+  `;
+
+  const AUTO_5KF_SCRIPT = `
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#hero", {
+      keyframes: {
+        "0%": { x: 0, y: 0, _auto: 1 },
+        "25%": { x: 50, y: 25 },
+        "50%": { x: 100, y: 50 },
+        "75%": { x: 150, y: 75 },
+        "100%": { x: 200, y: 100, _auto: 1 }
+      },
+      duration: 2
+    }, 0);
+  `;
+
+  it("addKeyframe adjacent to auto 100% — updates 100%", () => {
+    const id = getAnimId(AUTO_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_SCRIPT, id, 50, { x: 300, y: 200 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf100 = kfs.find((k) => k.percentage === 100)!;
+    expect(kf100.properties.x).toBe(300);
+    expect(kf100.properties.y).toBe(200);
+  });
+
+  it("addKeyframe adjacent to auto 0% — updates 0%", () => {
+    const id = getAnimId(AUTO_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_SCRIPT, id, 50, { x: 300, y: 200 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf0 = kfs.find((k) => k.percentage === 0)!;
+    expect(kf0.properties.x).toBe(300);
+    expect(kf0.properties.y).toBe(200);
+  });
+
+  it("addKeyframe NOT adjacent to auto 100% — leaves 100% untouched", () => {
+    const id = getAnimId(AUTO_5KF_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_5KF_SCRIPT, id, 74, { x: 999, y: 888 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf100 = kfs.find((k) => k.percentage === 100)!;
+    expect(kf100.properties.x).toBe(200);
+    expect(kf100.properties.y).toBe(100);
+  });
+
+  it("addKeyframe NOT adjacent to auto 0% — leaves 0% untouched", () => {
+    const id = getAnimId(AUTO_5KF_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_5KF_SCRIPT, id, 30, { x: 999, y: 888 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf0 = kfs.find((k) => k.percentage === 0)!;
+    expect(kf0.properties.x).toBe(0);
+    expect(kf0.properties.y).toBe(0);
+  });
+
+  it("addKeyframe at 88% in 5-keyframe set — updates adjacent 100% only", () => {
+    const id = getAnimId(AUTO_5KF_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_5KF_SCRIPT, id, 88, { x: 500, y: 400 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf100 = kfs.find((k) => k.percentage === 100)!;
+    const kf0 = kfs.find((k) => k.percentage === 0)!;
+    expect(kf100.properties.x).toBe(500);
+    expect(kf0.properties.x).toBe(0);
+  });
+
+  it("addKeyframe at 12% in 5-keyframe set — updates adjacent 0% only", () => {
+    const id = getAnimId(AUTO_5KF_SCRIPT);
+    const updated = addKeyframeToScript(AUTO_5KF_SCRIPT, id, 12, { x: 500, y: 400 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf0 = kfs.find((k) => k.percentage === 0)!;
+    const kf100 = kfs.find((k) => k.percentage === 100)!;
+    expect(kf0.properties.x).toBe(500);
+    expect(kf100.properties.x).toBe(200);
+  });
+
+  it("non-auto 100% is never modified", () => {
+    const id = getAnimId(KF_SCRIPT);
+    const updated = addKeyframeToScript(KF_SCRIPT, id, 50, { x: 999 });
+    const kfs = parseGsapScript(updated).animations[0].keyframes!.keyframes;
+    const kf100 = kfs.find((k) => k.percentage === 100)!;
+    expect(kf100.properties.x).toBe(200);
+    expect(kf100.properties.opacity).toBe(1);
+  });
+
   // ── removeKeyframeFromScript ────────────────────────────────────────────
 
   it("removeKeyframeFromScript — removes one keyframe", () => {
@@ -1449,18 +1716,11 @@ describe("keyframe mutations", () => {
       const tl = gsap.timeline({ paused: true });
       tl.from("#title", { x: -200, opacity: 0, duration: 0.8 }, 0.3);
     `;
-    const id = getAnimId(script);
-    const updated = convertToKeyframesInScript(script, id, { x: 0, opacity: 1 });
-    const reparsed = parseGsapScript(updated);
-    const anim = reparsed.animations[0];
-
+    const anim = convertAndReparse(script, { x: 0, opacity: 1 });
     expect(anim.method).toBe("to");
-    expect(anim.keyframes).toBeDefined();
-    const kfs = anim.keyframes!.keyframes;
-    expect(kfs[0].properties.x).toBe(-200);
-    expect(kfs[0].properties.opacity).toBe(0);
-    expect(kfs[1].properties.x).toBe(0);
-    expect(kfs[1].properties.opacity).toBe(1);
+    const kfs = expectKeyframesFormat(anim, "percentage", 2);
+    expectKeyframe(kfs[0]!, 0, { x: -200, opacity: 0 });
+    expectKeyframe(kfs[1]!, 100, { x: 0, opacity: 1 });
   });
 
   it("convertToKeyframesInScript — converts fromTo() to to() + keyframes", () => {
@@ -1468,16 +1728,11 @@ describe("keyframe mutations", () => {
       const tl = gsap.timeline({ paused: true });
       tl.fromTo("#title", { x: -100 }, { x: 100, duration: 1 }, 0);
     `;
-    const id = getAnimId(script);
-    const updated = convertToKeyframesInScript(script, id);
-    const reparsed = parseGsapScript(updated);
-    const anim = reparsed.animations[0];
-
+    const anim = convertAndReparse(script);
     expect(anim.method).toBe("to");
-    expect(anim.keyframes).toBeDefined();
-    const kfs = anim.keyframes!.keyframes;
-    expect(kfs[0].properties.x).toBe(-100);
-    expect(kfs[1].properties.x).toBe(100);
+    const kfs = expectKeyframesFormat(anim, "percentage", 2);
+    expect(kfs[0]!.properties.x).toBe(-100);
+    expect(kfs[1]!.properties.x).toBe(100);
   });
 
   it("convertToKeyframesInScript — skips if already has keyframes", () => {
@@ -1502,5 +1757,633 @@ describe("keyframe mutations", () => {
     expect(anim.keyframes).toBeUndefined();
     expect(anim.properties.x).toBe(200);
     expect(anim.properties.opacity).toBe(1);
+  });
+});
+
+describe("motionPath parsing", () => {
+  it("parses motionPath with waypoint array and curviness", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", {
+        motionPath: {
+          path: [{x: 0, y: 0}, {x: 200, y: -100}, {x: 400, y: 50}],
+          curviness: 1.5
+        },
+        duration: 2
+      }, 0);
+    `;
+    const result = parseGsapScript(script);
+    expect(result.animations).toHaveLength(1);
+    const anim = result.animations[0];
+
+    expect(anim.arcPath).toBeDefined();
+    expect(anim.arcPath!.enabled).toBe(true);
+    expect(anim.arcPath!.segments).toHaveLength(2);
+    expect(anim.arcPath!.segments[0].curviness).toBe(1.5);
+    expect(anim.arcPath!.segments[1].curviness).toBe(1.5);
+
+    expect(anim.keyframes).toBeDefined();
+    expect(anim.keyframes!.keyframes).toHaveLength(3);
+    expect(anim.keyframes!.keyframes[0].properties.x).toBe(0);
+    expect(anim.keyframes!.keyframes[0].properties.y).toBe(0);
+    expect(anim.keyframes!.keyframes[1].properties.x).toBe(200);
+    expect(anim.keyframes!.keyframes[1].properties.y).toBe(-100);
+    expect(anim.keyframes!.keyframes[2].properties.x).toBe(400);
+    expect(anim.keyframes!.keyframes[2].properties.y).toBe(50);
+  });
+
+  it("parses motionPath with type cubic and explicit control points", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", {
+        motionPath: {
+          path: [
+            {x: 0, y: 0},
+            {x: 50, y: -80}, {x: 150, y: -120},
+            {x: 200, y: -100},
+            {x: 250, y: -80}, {x: 350, y: 30},
+            {x: 400, y: 50}
+          ],
+          type: "cubic"
+        },
+        duration: 2
+      }, 0);
+    `;
+    const result = parseGsapScript(script);
+    const anim = result.animations[0];
+
+    expect(anim.arcPath).toBeDefined();
+    expect(anim.arcPath!.segments).toHaveLength(2);
+
+    expect(anim.arcPath!.segments[0].cp1).toEqual({ x: 50, y: -80 });
+    expect(anim.arcPath!.segments[0].cp2).toEqual({ x: 150, y: -120 });
+
+    expect(anim.arcPath!.segments[1].cp1).toEqual({ x: 250, y: -80 });
+    expect(anim.arcPath!.segments[1].cp2).toEqual({ x: 350, y: 30 });
+
+    expect(anim.keyframes!.keyframes).toHaveLength(3);
+    expect(anim.keyframes!.keyframes[0].properties).toEqual({ x: 0, y: 0 });
+    expect(anim.keyframes!.keyframes[1].properties).toEqual({ x: 200, y: -100 });
+    expect(anim.keyframes!.keyframes[2].properties).toEqual({ x: 400, y: 50 });
+  });
+
+  it("parses motionPath with autoRotate", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", {
+        motionPath: {
+          path: [{x: 0, y: 0}, {x: 200, y: 100}],
+          autoRotate: true
+        },
+        duration: 1
+      }, 0);
+    `;
+    const result = parseGsapScript(script);
+    const anim = result.animations[0];
+    expect(anim.arcPath!.autoRotate).toBe(true);
+  });
+
+  it("merges motionPath waypoints into existing keyframes", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", {
+        motionPath: {
+          path: [{x: 0, y: 0}, {x: 200, y: 100}],
+          curviness: 2
+        },
+        keyframes: {
+          "0%": { opacity: 1 },
+          "100%": { opacity: 0 }
+        },
+        duration: 2
+      }, 0);
+    `;
+    const result = parseGsapScript(script);
+    const anim = result.animations[0];
+
+    expect(anim.arcPath).toBeDefined();
+    expect(anim.arcPath!.segments).toHaveLength(1);
+    expect(anim.arcPath!.segments[0].curviness).toBe(2);
+
+    expect(anim.keyframes!.keyframes).toHaveLength(2);
+    expect(anim.keyframes!.keyframes[0].properties).toEqual({ opacity: 1, x: 0, y: 0 });
+    expect(anim.keyframes!.keyframes[1].properties).toEqual({ opacity: 0, x: 200, y: 100 });
+  });
+
+  it("skips motionPath with fewer than 2 waypoints", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", {
+        motionPath: { path: [{x: 0, y: 0}] },
+        duration: 1
+      }, 0);
+    `;
+    const result = parseGsapScript(script);
+    expect(result.animations[0].arcPath).toBeUndefined();
+  });
+
+  it("tween without motionPath parses identically to before", () => {
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#el", { x: 100, y: 200, duration: 1 }, 0);
+    `;
+    const result = parseGsapScript(script);
+    const anim = result.animations[0];
+    expect(anim.arcPath).toBeUndefined();
+    expect(anim.properties.x).toBe(100);
+    expect(anim.properties.y).toBe(200);
+  });
+});
+
+// ── addAnimationWithKeyframesToScript ──────────────────────────────────────
+
+describe("addAnimationWithKeyframesToScript", () => {
+  const BASE = `
+const tl = gsap.timeline({ paused: true });
+tl.to("#title", { x: 100, duration: 0.5 }, 0);
+  `.trim();
+
+  it("adds a new tween with keyframes after existing tweens", () => {
+    const { script, id } = addAnimationWithKeyframesToScript(BASE, "#box", 3, 0.5, [
+      { percentage: 0, properties: { x: 0 } },
+      { percentage: 100, properties: { x: 200 } },
+    ]);
+    expect(script).toContain("#box");
+    expect(script).toContain("keyframes");
+    expect(script).toContain('"0%"');
+    expect(script).toContain('"100%"');
+    expect(id).toBeTruthy();
+
+    const parsed = parseGsapScript(script);
+    expect(parsed.animations.length).toBe(2);
+    const newAnim = parsed.animations[1];
+    expect(newAnim.targetSelector).toBe("#box");
+    expect(newAnim.keyframes).toBeDefined();
+    expect(newAnim.keyframes!.keyframes.length).toBe(2);
+  });
+
+  it("preserves existing tween code", () => {
+    const { script } = addAnimationWithKeyframesToScript(BASE, "#new", 2, 1, [
+      { percentage: 0, properties: { opacity: 0 } },
+      { percentage: 100, properties: { opacity: 1 } },
+    ]);
+    expect(script).toContain("#title");
+    expect(script).toContain("x: 100");
+  });
+
+  it("produces a stable ID for the new animation", () => {
+    const { script, id } = addAnimationWithKeyframesToScript(BASE, "#el", 1, 1, [
+      { percentage: 0, properties: { y: 0 } },
+      { percentage: 100, properties: { y: 100 } },
+    ]);
+    expect(id).toContain("#el");
+    const parsed = parseGsapScript(script);
+    const match = parsed.animations.find((a) => a.id === id);
+    expect(match).toBeDefined();
+  });
+
+  it("includes per-keyframe ease when provided", () => {
+    const { script } = addAnimationWithKeyframesToScript(BASE, "#el", 0, 1, [
+      { percentage: 0, properties: { x: 0 }, ease: "power2.out" },
+      { percentage: 100, properties: { x: 100 } },
+    ]);
+    expect(script).toContain("power2.out");
+  });
+
+  it("returns original script on parse failure", () => {
+    const { script, id } = addAnimationWithKeyframesToScript("not valid js {{", "#el", 0, 1, [
+      { percentage: 0, properties: { x: 0 } },
+    ]);
+    expect(script).toBe("not valid js {{");
+    expect(id).toBe("");
+  });
+});
+
+describe("splitAnimationsInScript", () => {
+  const baseScript = `const tl = gsap.timeline({ paused: true });`;
+  const opts = {
+    originalId: "el1",
+    newId: "el1-split",
+    splitTime: 2,
+    elementStart: 0,
+    elementDuration: 4,
+  };
+
+  const split = (script: string, o = opts) => splitAnimationsInScript(script, o).script;
+
+  it("keeps animation entirely in first half and adds set for inherited state", () => {
+    const script = `${baseScript}\ntl.to("#el1", { x: 100, duration: 1 }, 0);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal).toHaveLength(1);
+    expect(forNew).toHaveLength(1);
+    expect(forNew[0]!.method).toBe("set");
+    expect(forNew[0]!.properties.x).toBe(100);
+    expect(forNew[0]!.position).toBe(opts.splitTime);
+  });
+
+  it("retargets animation entirely in second half to new element", () => {
+    const script = `${baseScript}\ntl.to("#el1", { x: 100, duration: 1 }, 3);`;
+    const selectors = parseSplitAndAssert(script, (s) => split(s), 1);
+    expect(selectors[0]).toBe("#el1-split");
+  });
+
+  it("splits spanning tween with linear interpolation and fromTo on clone", () => {
+    const script = `${baseScript}\ntl.to("#el1", { opacity: 1, duration: 4 }, 0);`;
+    const setupOpts = { ...opts, splitTime: 2, elementDuration: 4 };
+    const result = split(script, setupOpts);
+    const parsed = parseGsapScript(result);
+    const first = parsed.animations.find((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    const continuation = forNew.find((a) => a.method === "fromTo");
+    expect(first).toBeDefined();
+    expect(first!.duration).toBe(2);
+    expect(first!.properties.opacity).toBe(0.5);
+    expect(continuation).toBeDefined();
+    expect(continuation!.duration).toBe(2);
+    expect(continuation!.fromProperties?.opacity).toBe(0.5);
+    expect(continuation!.properties.opacity).toBe(1);
+  });
+
+  it("retargets multiple animations at the same position both after split", () => {
+    const script = `${baseScript}\ntl.to("#el1", { x: 100, duration: 1 }, 3);\ntl.to("#el1", { y: 200, duration: 1 }, 3);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal.length).toBe(0);
+    expect(forNew.length).toBe(2);
+  });
+
+  it("returns script unchanged when no matching animations", () => {
+    const script = `${baseScript}\ntl.to("#other", { x: 100, duration: 1 }, 0);`;
+    const result = split(script);
+    expect(result).toBe(script);
+  });
+
+  it("handles multiple animations independently", () => {
+    const script = `${baseScript}
+tl.to("#el1", { x: 100, duration: 1 }, 0);
+tl.to("#el1", { y: 200, duration: 1 }, 3);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal).toHaveLength(1);
+    expect(forOriginal[0]!.properties.x).toBe(100);
+    expect(forNew).toHaveLength(2);
+    const retargeted = forNew.find((a) => a.method === "to");
+    const inherited = forNew.find((a) => a.method === "set");
+    expect(retargeted!.properties.y).toBe(200);
+    expect(inherited!.properties.x).toBe(100);
+  });
+
+  it("interpolates fromTo properties at split point on both halves", () => {
+    const script = `${baseScript}\ntl.fromTo("#el1", { opacity: 0 }, { opacity: 1, duration: 4 }, 0);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    const first = parsed.animations.find((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    const continuation = forNew.find((a) => a.method === "fromTo");
+    expect(first!.properties.opacity).toBe(0.5);
+    expect(continuation).toBeDefined();
+    expect(continuation!.fromProperties?.opacity).toBe(0.5);
+    expect(continuation!.properties.opacity).toBe(1);
+  });
+
+  it("round-trips correctly through parseGsapScript", () => {
+    const script = `${baseScript}\ntl.to("#el1", { x: 100, duration: 4 }, 0);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    expect(parsed.animations.length).toBeGreaterThanOrEqual(2);
+    for (const anim of parsed.animations) {
+      expect(typeof anim.position).toBe("number");
+      if (anim.method !== "set") expect(anim.duration).toBeGreaterThan(0);
+    }
+  });
+
+  it("leaves spanning keyframes on original and warns via skippedSelectors", () => {
+    const script = `${baseScript}\ntl.to("#el1", { keyframes: [{ opacity: 1, duration: 1 }, { scale: 1.2, duration: 1 }, { x: 50, duration: 1 }] }, 1);`;
+    const splitOpts = {
+      originalId: "el1",
+      newId: "el1-split",
+      splitTime: 2.5,
+      elementStart: 0,
+      elementDuration: 5,
+    };
+    const fullResult = splitAnimationsInScript(script, splitOpts);
+    const parsed = parseGsapScript(fullResult.script);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal.length).toBe(1);
+    expect(forOriginal[0]!.keyframes).toBeDefined();
+    expect(forNew.length).toBe(1);
+    expect(forNew[0]!.method).toBe("set");
+    expect(forNew[0]!.properties.opacity).toBe(1);
+    expect(fullResult.skippedSelectors).toContain("#el1 (keyframes spanning split)");
+  });
+
+  it("retargets keyframes animation entirely after split", () => {
+    const script = `${baseScript}\ntl.to("#el1", { keyframes: [{ opacity: 1, duration: 0.5 }, { scale: 1.2, duration: 0.5 }] }, 4);`;
+    const splitOpts = {
+      originalId: "el1",
+      newId: "el1-split",
+      splitTime: 3,
+      elementStart: 0,
+      elementDuration: 5,
+    };
+    const result = split(script, splitOpts);
+    const parsed = parseGsapScript(result);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal.length).toBe(0);
+    expect(forNew.length).toBe(1);
+    expect(forNew[0]!.keyframes).toBeDefined();
+  });
+
+  it("keeps keyframes animation entirely before split and inherits final keyframe state", () => {
+    const script = `${baseScript}\ntl.to("#el1", { keyframes: [{ opacity: 1, duration: 0.5 }, { scale: 1.2, duration: 0.5 }] }, 0);\ntl.to("#el1", { y: 100, duration: 1 }, 4);`;
+    const splitOpts = {
+      originalId: "el1",
+      newId: "el1-split",
+      splitTime: 3,
+      elementStart: 0,
+      elementDuration: 5,
+    };
+    const result = split(script, splitOpts);
+    const parsed = parseGsapScript(result);
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    const setState = forNew.find((a) => a.method === "set");
+    expect(setState).toBeDefined();
+    expect(setState!.properties.scale).toBe(1.2);
+  });
+
+  it("retargets set tween entirely after split", () => {
+    const script = `${baseScript}\ntl.set("#el1", { opacity: 0 }, 3);`;
+    const result = split(script);
+    const parsed = parseGsapScript(result);
+    const forOriginal = parsed.animations.filter((a) => a.targetSelector === "#el1");
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    expect(forOriginal.length).toBe(0);
+    expect(forNew.length).toBe(1);
+    expect(forNew[0]!.method).toBe("set");
+    expect(forNew[0]!.position).toBe(3);
+  });
+
+  it("inserts inherited state set before other tweens targeting new element", () => {
+    const script = `${baseScript}\ntl.to("#el1", { opacity: 1, x: 50, duration: 0.5 }, 0);\ntl.to("#el1", { opacity: 0, duration: 0.5 }, 5);`;
+    const splitOpts = {
+      originalId: "el1",
+      newId: "el1-split",
+      splitTime: 3,
+      elementStart: 0,
+      elementDuration: 6,
+    };
+    const result = split(script, splitOpts);
+    const parsed = parseGsapScript(result);
+    const forNew = parsed.animations.filter((a) => a.targetSelector === "#el1-split");
+    const setState = forNew.find((a) => a.method === "set");
+    const exitTween = forNew.find((a) => a.method === "to");
+    expect(setState).toBeDefined();
+    expect(exitTween).toBeDefined();
+    expect(setState!.properties.opacity).toBe(1);
+    expect(setState!.properties.x).toBe(50);
+    const setIdx = parsed.animations.indexOf(setState!);
+    const exitIdx = parsed.animations.indexOf(exitTween!);
+    expect(setIdx).toBeLessThan(exitIdx);
+  });
+
+  it("reports skipped selectors for non-ID-based animations referencing the element", () => {
+    const script = `${baseScript}\ntl.to("#el1", { x: 100, duration: 1 }, 0);\ntl.to(".el1", { opacity: 0, duration: 1 }, 1);`;
+    const result = splitAnimationsInScript(script, opts);
+    expect(result.skippedSelectors).toEqual([".el1"]);
+  });
+});
+
+describe("splitIntoPropertyGroups", () => {
+  const baseScript = `const tl = gsap.timeline({ paused: true });`;
+
+  it("splits flat to({x, y, scale, rotation}) into 3 group tweens", () => {
+    const script = `${baseScript}\ntl.to("#el", { x: 100, y: 50, scale: 1.5, rotation: 45, duration: 1 }, 0);`;
+    const parsed = parseGsapScript(script);
+    const animId = parsed.animations[0]!.id;
+
+    const result = splitIntoPropertyGroups(script, animId);
+    const reParsed = parseGsapScript(result.script);
+
+    // Should produce 3 tweens: position (x,y), scale, rotation
+    expect(reParsed.animations).toHaveLength(3);
+    expect(result.ids).toHaveLength(3);
+
+    const groups = new Set(reParsed.animations.map((a) => a.propertyGroup));
+    expect(groups.has("position")).toBe(true);
+    expect(groups.has("scale")).toBe(true);
+    expect(groups.has("rotation")).toBe(true);
+
+    const posAnim = reParsed.animations.find((a) => a.propertyGroup === "position")!;
+    expect(posAnim.properties.x).toBe(100);
+    expect(posAnim.properties.y).toBe(50);
+    expect(posAnim.properties.scale).toBeUndefined();
+
+    const scaleAnim = reParsed.animations.find((a) => a.propertyGroup === "scale")!;
+    expect(scaleAnim.properties.scale).toBe(1.5);
+    expect(scaleAnim.properties.x).toBeUndefined();
+
+    const rotAnim = reParsed.animations.find((a) => a.propertyGroup === "rotation")!;
+    expect(rotAnim.properties.rotation).toBe(45);
+  });
+
+  it("splits flat from({scale, opacity}) into 2 group tweens", () => {
+    const script = `${baseScript}\ntl.from("#el", { scale: 0.5, opacity: 0, duration: 0.5 }, 1);`;
+    const parsed = parseGsapScript(script);
+    const animId = parsed.animations[0]!.id;
+
+    const result = splitIntoPropertyGroups(script, animId);
+    const reParsed = parseGsapScript(result.script);
+
+    expect(reParsed.animations).toHaveLength(2);
+    expect(result.ids).toHaveLength(2);
+
+    const groups = new Set(reParsed.animations.map((a) => a.propertyGroup));
+    expect(groups.has("scale")).toBe(true);
+    expect(groups.has("visual")).toBe(true);
+  });
+
+  it("returns same ID for single-group tween (no split)", () => {
+    const script = `${baseScript}\ntl.to("#el", { x: 100, y: 50, duration: 1 }, 0);`;
+    const parsed = parseGsapScript(script);
+    const animId = parsed.animations[0]!.id;
+
+    const result = splitIntoPropertyGroups(script, animId);
+    expect(result.ids).toEqual([animId]);
+    // Script should be unchanged
+    const reParsed = parseGsapScript(result.script);
+    expect(reParsed.animations).toHaveLength(1);
+  });
+
+  it("preserves position, duration, ease on split tweens", () => {
+    const script = `${baseScript}\ntl.to("#el", { x: 100, scale: 2, duration: 0.8, ease: "power2.out" }, 1.5);`;
+    const parsed = parseGsapScript(script);
+    const animId = parsed.animations[0]!.id;
+
+    const result = splitIntoPropertyGroups(script, animId);
+    const reParsed = parseGsapScript(result.script);
+
+    expect(reParsed.animations).toHaveLength(2);
+    for (const anim of reParsed.animations) {
+      expect(anim.position).toBe(1.5);
+      expect(anim.duration).toBe(0.8);
+      expect(anim.ease).toBe("power2.out");
+    }
+  });
+
+  it("splits keyframed tween: each group gets only its properties per keyframe", () => {
+    const script = `${baseScript}\ntl.to("#el", { keyframes: { "0%": { x: 0, scale: 1 }, "50%": { x: 50, scale: 1.5 }, "100%": { x: 100, scale: 2 } }, duration: 2 }, 0);`;
+    const parsed = parseGsapScript(script);
+    const animId = parsed.animations[0]!.id;
+
+    const result = splitIntoPropertyGroups(script, animId);
+    const reParsed = parseGsapScript(result.script);
+
+    expect(reParsed.animations).toHaveLength(2);
+    expect(result.ids).toHaveLength(2);
+
+    // Both tweens are keyframed — identify them by the properties inside their keyframes.
+    const xAnim = reParsed.animations.find((a) =>
+      a.keyframes?.keyframes.some((kf) => "x" in kf.properties),
+    )!;
+    const scaleAnim = reParsed.animations.find((a) =>
+      a.keyframes?.keyframes.some((kf) => "scale" in kf.properties),
+    )!;
+
+    expect(xAnim).toBeDefined();
+    expect(xAnim.keyframes).toBeDefined();
+    expect(xAnim.keyframes!.keyframes).toHaveLength(3);
+    // Position keyframes should have x but not scale
+    for (const kf of xAnim.keyframes!.keyframes) {
+      expect(kf.properties.x).toBeDefined();
+      expect(kf.properties.scale).toBeUndefined();
+    }
+
+    expect(scaleAnim).toBeDefined();
+    expect(scaleAnim.keyframes).toBeDefined();
+    expect(scaleAnim.keyframes!.keyframes).toHaveLength(3);
+    // Scale keyframes should have scale but not x
+    for (const kf of scaleAnim.keyframes!.keyframes) {
+      expect(kf.properties.scale).toBeDefined();
+      expect(kf.properties.x).toBeUndefined();
+    }
+  });
+});
+
+describe("shiftPositionsInScript", () => {
+  it("shifts all numeric positions for the target selector", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.from("#hero", { opacity: 0, duration: 1 }, 0);
+tl.to("#hero", { opacity: 0, duration: 0.5 }, 2.5);
+tl.from("#bg", { scale: 0, duration: 1 }, 1);`;
+    const result = shiftPositionsInScript(script, "#hero", 3);
+    const parsed = parseGsapScript(result);
+    const hero = parsed.animations.filter((a) => a.targetSelector === "#hero");
+    expect(hero[0].position).toBe(3);
+    expect(hero[1].position).toBe(5.5);
+    const bg = parsed.animations.find((a) => a.targetSelector === "#bg");
+    expect(bg!.position).toBe(1);
+  });
+
+  it("clamps negative-going positions to zero", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 0.3);
+tl.to("#el", { y: 50, duration: 1 }, 1.5);`;
+    const result = shiftPositionsInScript(script, "#el", -1.0);
+    const parsed = parseGsapScript(result);
+    const anims = parsed.animations.filter((a) => a.targetSelector === "#el");
+    expect(anims[0].position).toBe(0);
+    expect(anims[1].position).toBe(0.5);
+  });
+
+  it("returns the original script when delta is zero", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 2);`;
+    expect(shiftPositionsInScript(script, "#el", 0)).toBe(script);
+  });
+
+  it("does not collide when two tweens have adjacent positions", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#burst", { opacity: 1, duration: 0.5 }, 1.0);
+tl.to("#burst", { opacity: 0, duration: 0.5 }, 1.5);`;
+    const result = shiftPositionsInScript(script, "#burst", 0.5);
+    const parsed = parseGsapScript(result);
+    const burst = parsed.animations.filter((a) => a.targetSelector === "#burst");
+    expect(burst[0].position).toBe(1.5);
+    expect(burst[1].position).toBe(2);
+  });
+
+  it("skips string positions", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 2);
+tl.to("#el", { y: 50, duration: 1 }, "+=0.5");`;
+    const result = shiftPositionsInScript(script, "#el", 1);
+    const parsed = parseGsapScript(result);
+    expect(parsed.animations[0].position).toBe(3);
+    expect(parsed.animations[1].position).toBe("+=0.5");
+  });
+});
+
+describe("scalePositionsInScript", () => {
+  it("scales positions and durations proportionally for the target selector", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.from("#hero", { opacity: 0, duration: 1 }, 0);
+tl.to("#hero", { opacity: 0, duration: 0.5 }, 2.5);
+tl.from("#bg", { scale: 0, duration: 1 }, 1);`;
+    const result = scalePositionsInScript(script, "#hero", 0, 3, 0, 2);
+    const parsed = parseGsapScript(result);
+    const hero = parsed.animations.filter((a) => a.targetSelector === "#hero");
+    expect(hero[0].position).toBe(0);
+    expect(hero[0].duration).toBeCloseTo(0.667, 2);
+    expect(hero[1].position).toBeCloseTo(1.667, 2);
+    expect(hero[1].duration).toBeCloseTo(0.333, 2);
+    const bg = parsed.animations.find((a) => a.targetSelector === "#bg");
+    expect(bg!.position).toBe(1);
+    expect(bg!.duration).toBe(1);
+  });
+
+  it("handles start-edge resize (new start + shorter duration)", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.from("#el", { opacity: 0, duration: 1 }, 0);
+tl.to("#el", { y: 50, duration: 0.5 }, 2.5);`;
+    const result = scalePositionsInScript(script, "#el", 0, 3, 1, 2);
+    const parsed = parseGsapScript(result);
+    const anims = parsed.animations.filter((a) => a.targetSelector === "#el");
+    expect(anims[0].position).toBe(1);
+    expect(anims[0].duration).toBeCloseTo(0.667, 2);
+    expect(anims[1].position).toBeCloseTo(2.667, 2);
+    expect(anims[1].duration).toBeCloseTo(0.333, 2);
+  });
+
+  it("clamps negative-going positions to zero", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 2);`;
+    const result = scalePositionsInScript(script, "#el", 2, 1, 0, 0.5);
+    const parsed = parseGsapScript(result);
+    expect(parsed.animations[0].position).toBe(0);
+  });
+
+  it("returns the original script when old and new timing are identical", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 2);`;
+    expect(scalePositionsInScript(script, "#el", 0, 3, 0, 3)).toBe(script);
+  });
+
+  it("skips string positions", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#el", { x: 100, duration: 1 }, 2);
+tl.to("#el", { y: 50, duration: 1 }, "+=0.5");`;
+    const result = scalePositionsInScript(script, "#el", 0, 3, 0, 2);
+    const parsed = parseGsapScript(result);
+    expect(parsed.animations[0].position).toBeCloseTo(1.333, 2);
+    expect(parsed.animations[1].position).toBe("+=0.5");
   });
 });

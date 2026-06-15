@@ -1,5 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type { DomEditSelection } from "../components/editor/domEditing";
+import { usePlayerStore } from "../player";
+import { trackStudioSaveFailure } from "../utils/studioSaveDiagnostics";
 
 /**
  * Thin useCallback wrappers that guard on `domEditSelection` before
@@ -12,6 +14,7 @@ export function useGsapSelectionHandlers({
   updateGsapProperty,
   updateGsapMeta,
   deleteGsapAnimation,
+  deleteAllForSelector,
   addGsapAnimation,
   addGsapProperty,
   removeGsapProperty,
@@ -19,10 +22,10 @@ export function useGsapSelectionHandlers({
   addGsapFromProperty,
   removeGsapFromProperty,
   addKeyframe,
+  addKeyframeBatch,
   removeKeyframe,
   convertToKeyframes,
   removeAllKeyframes,
-  currentTime,
   handleDomManualEditsReset,
   selectedGsapAnimations,
 }: {
@@ -39,11 +42,12 @@ export function useGsapSelectionHandlers({
     updates: { duration?: number; ease?: string; position?: number },
   ) => void;
   deleteGsapAnimation: (sel: DomEditSelection, animId: string) => void;
+  deleteAllForSelector: (sel: DomEditSelection, targetSelector: string) => void;
   addGsapAnimation: (
     sel: DomEditSelection,
     method: "to" | "from" | "set" | "fromTo",
     time: number,
-  ) => void;
+  ) => Promise<void>;
   addGsapProperty: (sel: DomEditSelection, animId: string, prop: string) => void;
   removeGsapProperty: (sel: DomEditSelection, animId: string, prop: string) => void;
   updateGsapFromProperty: (
@@ -61,13 +65,42 @@ export function useGsapSelectionHandlers({
     property: string,
     value: number | string,
   ) => void;
+  addKeyframeBatch: (
+    sel: DomEditSelection,
+    animId: string,
+    percentage: number,
+    properties: Record<string, number | string>,
+  ) => Promise<void>;
   removeKeyframe: (sel: DomEditSelection, animId: string, percentage: number) => void;
-  convertToKeyframes: (sel: DomEditSelection, animId: string) => void;
+  convertToKeyframes: (
+    sel: DomEditSelection,
+    animId: string,
+    resolvedFromValues?: Record<string, number | string>,
+  ) => Promise<void>;
   removeAllKeyframes: (sel: DomEditSelection, animId: string) => void;
-  currentTime: number;
+
   handleDomManualEditsReset: (sel: DomEditSelection) => void;
   selectedGsapAnimations: { id: string; keyframes?: unknown }[];
 }) {
+  const lastSelectionRef = useRef<DomEditSelection | null>(null);
+  if (domEditSelection) lastSelectionRef.current = domEditSelection;
+
+  const trackGsapHandlerFailure = useCallback(
+    (error: unknown, selection: DomEditSelection, mutationType: string, label: string) => {
+      trackStudioSaveFailure({
+        source: "gsap_commit",
+        error,
+        filePath: selection.sourceFile ?? undefined,
+        mutationType,
+        label,
+        targetId: selection.id,
+        targetSelector: selection.selector,
+        targetSourceFile: selection.sourceFile,
+      });
+    },
+    [],
+  );
+
   const handleGsapUpdateProperty = useCallback(
     (animId: string, prop: string, value: number | string) => {
       if (!domEditSelection) return;
@@ -77,30 +110,49 @@ export function useGsapSelectionHandlers({
   );
 
   const handleGsapUpdateMeta = useCallback(
-    (animId: string, updates: { duration?: number; ease?: string; position?: number }) => {
-      if (!domEditSelection) return;
-      updateGsapMeta(domEditSelection, animId, updates);
+    (
+      animId: string,
+      updates: { duration?: number; ease?: string; position?: number },
+      selectionOverride?: DomEditSelection | null,
+    ) => {
+      const sel = selectionOverride ?? domEditSelection ?? lastSelectionRef.current;
+      if (!sel) return;
+      updateGsapMeta(sel, animId, updates);
     },
     [domEditSelection, updateGsapMeta],
   );
 
   const handleGsapDeleteAnimation = useCallback(
     (animId: string) => {
-      if (!domEditSelection) return;
-      deleteGsapAnimation(domEditSelection, animId);
+      const sel = domEditSelection ?? lastSelectionRef.current;
+      if (!sel) return;
+      deleteGsapAnimation(sel, animId);
     },
     [domEditSelection, deleteGsapAnimation],
+  );
+
+  const handleGsapDeleteAllForElement = useCallback(
+    (targetSelector: string) => {
+      const sel = domEditSelection ?? lastSelectionRef.current;
+      if (!sel) return;
+      deleteAllForSelector(sel, targetSelector);
+    },
+    [domEditSelection, deleteAllForSelector],
   );
 
   const handleGsapAddAnimation = useCallback(
     (method: "to" | "from" | "set" | "fromTo") => {
       if (!domEditSelection) return;
-      addGsapAnimation(domEditSelection, method, currentTime);
+      void addGsapAnimation(domEditSelection, method, usePlayerStore.getState().currentTime).catch(
+        (error) => {
+          trackGsapHandlerFailure(error, domEditSelection, "add", `Add GSAP ${method} animation`);
+        },
+      );
       if (domEditSelection.element.hasAttribute("data-hf-studio-path-offset")) {
         handleDomManualEditsReset(domEditSelection);
       }
     },
-    [domEditSelection, addGsapAnimation, currentTime, handleDomManualEditsReset],
+    [domEditSelection, addGsapAnimation, handleDomManualEditsReset, trackGsapHandlerFailure],
   );
 
   const handleGsapAddProperty = useCallback(
@@ -144,27 +196,51 @@ export function useGsapSelectionHandlers({
   );
 
   const handleGsapAddKeyframe = useCallback(
-    (animId: string, percentage: number, property: string, value: number | string) => {
-      if (!domEditSelection) return;
-      addKeyframe(domEditSelection, animId, percentage, property, value);
+    (
+      animId: string,
+      percentage: number,
+      property: string,
+      value: number | string,
+      selectionOverride?: DomEditSelection | null,
+    ) => {
+      const sel = selectionOverride ?? domEditSelection ?? lastSelectionRef.current;
+      if (!sel) return;
+      addKeyframe(sel, animId, percentage, property, value);
     },
     [domEditSelection, addKeyframe],
   );
 
+  const handleGsapAddKeyframeBatch = useCallback(
+    (animId: string, percentage: number, properties: Record<string, number | string>) => {
+      if (!domEditSelection) return Promise.resolve();
+      return addKeyframeBatch(domEditSelection, animId, percentage, properties).catch((error) => {
+        trackGsapHandlerFailure(error, domEditSelection, "add-keyframe", "Add keyframe");
+      });
+    },
+    [domEditSelection, addKeyframeBatch, trackGsapHandlerFailure],
+  );
   const handleGsapRemoveKeyframe = useCallback(
-    (animId: string, percentage: number) => {
-      if (!domEditSelection) return;
-      removeKeyframe(domEditSelection, animId, percentage);
+    (animId: string, percentage: number, selectionOverride?: DomEditSelection | null) => {
+      const sel = selectionOverride ?? domEditSelection ?? lastSelectionRef.current;
+      if (!sel) return;
+      removeKeyframe(sel, animId, percentage);
     },
     [domEditSelection, removeKeyframe],
   );
 
   const handleGsapConvertToKeyframes = useCallback(
-    (animId: string) => {
-      if (!domEditSelection) return;
-      convertToKeyframes(domEditSelection, animId);
+    (animId: string, resolvedFromValues?: Record<string, number | string>) => {
+      if (!domEditSelection) return Promise.resolve();
+      return convertToKeyframes(domEditSelection, animId, resolvedFromValues).catch((error) => {
+        trackGsapHandlerFailure(
+          error,
+          domEditSelection,
+          "convert-to-keyframes",
+          "Convert to keyframes",
+        );
+      });
     },
-    [domEditSelection, convertToKeyframes],
+    [domEditSelection, convertToKeyframes, trackGsapHandlerFailure],
   );
 
   const handleGsapRemoveAllKeyframes = useCallback(
@@ -187,6 +263,7 @@ export function useGsapSelectionHandlers({
     handleGsapUpdateProperty,
     handleGsapUpdateMeta,
     handleGsapDeleteAnimation,
+    handleGsapDeleteAllForElement,
     handleGsapAddAnimation,
     handleGsapAddProperty,
     handleGsapRemoveProperty,
@@ -194,6 +271,7 @@ export function useGsapSelectionHandlers({
     handleGsapAddFromProperty,
     handleGsapRemoveFromProperty,
     handleGsapAddKeyframe,
+    handleGsapAddKeyframeBatch,
     handleGsapRemoveKeyframe,
     handleGsapConvertToKeyframes,
     handleGsapRemoveAllKeyframes,

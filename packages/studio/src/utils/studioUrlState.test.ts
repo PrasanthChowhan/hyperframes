@@ -159,7 +159,6 @@ describe("studio url state", () => {
   it("normalizes url tabs against feature flags", () => {
     expect(normalizeStudioUrlPanelTab("renders")).toBe("renders");
     expect(normalizeStudioUrlPanelTab("layers", { inspectorPanelsEnabled: false })).toBe("renders");
-    expect(normalizeStudioUrlPanelTab("motion", { motionPanelEnabled: false })).toBe("design");
   });
 
   it("hydrates seek first, preserves the initial url state, then restores selection", async () => {
@@ -231,6 +230,15 @@ describe("studio url state", () => {
     expect(window.location.hash).toContain("t=4.2");
     expect(applyDomSelection).not.toHaveBeenCalled();
 
+    // Drive the hook's internal currentTime read. Per #1311 the hook stopped
+    // taking currentTime as a prop and now subscribes to the player store
+    // directly (usePlayerStore((s) => s.currentTime)). The harness prop is a
+    // no-op; the selection-hydration useEffect's time-stability guard
+    // (`Math.abs(currentTime - stableTimeRef.current) > 0.05`) only passes
+    // once the store's currentTime catches up to the seek target.
+    act(() => {
+      usePlayerStore.setState({ currentTime: 4.2 });
+    });
     harness.rerender({ currentTime: 4.2 });
     await act(async () => {
       vi.advanceTimersByTime(250);
