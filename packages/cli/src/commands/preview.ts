@@ -169,7 +169,7 @@ export default defineCommand({
       return;
     }
 
-    if (isDevMode()) {
+    if (isDevMode() && !process.env.HF_FORCE_EMBEDDED_STUDIO) {
       return runDevMode(dir, {
         projectName,
         noOpen,
@@ -180,7 +180,7 @@ export default defineCommand({
     }
 
     // If @hyperframes/studio is installed locally, use Vite for full HMR
-    if (hasLocalStudio(dir)) {
+    if (hasLocalStudio(dir) && !process.env.HF_FORCE_EMBEDDED_STUDIO) {
       return runLocalStudioMode(dir, {
         projectName,
         noOpen,
@@ -506,6 +506,9 @@ async function runEmbeddedMode(
 
   if (result.type === "already-running") {
     const url = `http://localhost:${result.port}`;
+    if (process.env.HF_FORCE_EMBEDDED_STUDIO) {
+      console.log(`__ANIMAKER_ENGINE_READY:${result.port}__`);
+    }
     s.stop(c.success("Already running"));
     console.log();
     console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
@@ -526,6 +529,9 @@ async function runEmbeddedMode(
   }
 
   const url = `http://localhost:${result.port}`;
+  if (process.env.HF_FORCE_EMBEDDED_STUDIO) {
+    console.log(`__ANIMAKER_ENGINE_READY:${result.port}__`);
+  }
   s.stop(c.success("Studio running"));
   console.log();
   if (result.port !== startPort) {
