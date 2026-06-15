@@ -1,5 +1,8 @@
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo } from "react";
+import { createPortal } from "react-dom";
 import type { TimelineElement } from "../store/playerStore";
+import { canSplitElement } from "../../utils/timelineElementSplit";
+import { useContextMenuDismiss } from "../../hooks/useContextMenuDismiss";
 
 interface ClipContextMenuProps {
   x: number;
@@ -20,30 +23,15 @@ export const ClipContextMenu = memo(function ClipContextMenu({
   onSplit,
   onDelete,
 }: ClipContextMenuProps) {
-  const menuRef = useRef<HTMLDivElement>(null);
+  const menuRef = useContextMenuDismiss(onClose);
 
-  const dismiss = useCallback(
-    (e: MouseEvent | KeyboardEvent) => {
-      if (e instanceof KeyboardEvent && e.key !== "Escape") return;
-      if (e instanceof MouseEvent && menuRef.current?.contains(e.target as Node)) return;
-      onClose();
-    },
-    [onClose],
-  );
+  const menuWidth = 200;
+  const menuHeight = 80;
+  const overflowY = y + menuHeight - window.innerHeight;
+  const adjustedX = x + menuWidth > window.innerWidth ? x - menuWidth : x;
+  const adjustedY = overflowY > 0 ? y - overflowY - 8 : y;
 
-  useEffect(() => {
-    document.addEventListener("mousedown", dismiss);
-    document.addEventListener("keydown", dismiss);
-    return () => {
-      document.removeEventListener("mousedown", dismiss);
-      document.removeEventListener("keydown", dismiss);
-    };
-  }, [dismiss]);
-
-  const adjustedX = Math.min(x, window.innerWidth - 200);
-  const adjustedY = Math.min(y, window.innerHeight - 200);
-
-  const isSplittable = ["video", "audio", "img"].includes(element.tag);
+  const isSplittable = canSplitElement(element) && ["video", "audio", "img"].includes(element.tag);
   const canSplit =
     isSplittable && currentTime > element.start && currentTime < element.start + element.duration;
 
@@ -53,7 +41,7 @@ export const ClipContextMenu = memo(function ClipContextMenu({
       ? `Split at ${currentTime.toFixed(2)}s`
       : "Split (move playhead inside clip)";
 
-  return (
+  return createPortal(
     <div
       ref={menuRef}
       className="fixed z-50 bg-neutral-900 border border-neutral-700 rounded-md shadow-lg py-1 min-w-[180px]"
@@ -94,6 +82,7 @@ export const ClipContextMenu = memo(function ClipContextMenu({
         <span>Delete</span>
         <span className="text-neutral-500 text-[10px] ml-3">⌫</span>
       </button>
-    </div>
+    </div>,
+    document.body,
   );
 });

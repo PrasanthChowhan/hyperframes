@@ -10,7 +10,6 @@ import {
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { useTimelinePlayer, PlayerControls, Timeline, usePlayerStore } from "../../player";
 import type { TimelineElement } from "../../player";
-import type { BlockedTimelineEditIntent } from "../../player/components/timelineEditing";
 import { NLEPreview } from "./NLEPreview";
 import { CompositionBreadcrumb } from "./CompositionBreadcrumb";
 import { usePreviewBlockDrop } from "./usePreviewBlockDrop";
@@ -59,23 +58,7 @@ interface NLELayoutProps {
     blockName: string,
     position: { left: number; top: number },
   ) => Promise<void> | void;
-  /** Persist timeline move actions back into source HTML */
-  onMoveElement?: (
-    element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "track">,
-  ) => Promise<void> | void;
-  onResizeElement?: (
-    element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "duration" | "playbackStart">,
-  ) => Promise<void> | void;
-  onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedTimelineEditIntent) => void;
-  onSplitElement?: (element: TimelineElement, splitTime: number) => Promise<void> | void;
   onSelectTimelineElement?: (element: TimelineElement | null) => void;
-  onDeleteKeyframe?: (elementId: string, percentage: number) => void;
-  onDeleteAllKeyframes?: (elementId: string) => void;
-  onChangeKeyframeEase?: (elementId: string, percentage: number, ease: string) => void;
-  onMoveKeyframe?: (element: TimelineElement, oldPct: number, newPct: number) => void;
-  onToggleKeyframeAtPlayhead?: (element: TimelineElement) => void;
   /** Exposes the compIdToSrc map for parent components (e.g., useRenderClipContent) */
   onCompIdToSrcChange?: (map: Map<string, string>) => void;
   /** Whether the timeline panel is visible (default: true) */
@@ -120,16 +103,7 @@ export const NLELayout = memo(function NLELayout({
   onAssetDrop,
   onBlockDrop,
   onPreviewBlockDrop,
-  onMoveElement,
-  onResizeElement,
-  onBlockedEditAttempt,
-  onSplitElement,
   onSelectTimelineElement,
-  onDeleteKeyframe,
-  onDeleteAllKeyframes,
-  onChangeKeyframeEase,
-  onMoveKeyframe,
-  onToggleKeyframeAtPlayhead,
   onCompIdToSrcChange,
   timelineVisible,
   onToggleTimeline,
@@ -380,25 +354,27 @@ export const NLELayout = memo(function NLELayout({
       {/* Preview + player controls */}
       <div className="flex-1 min-h-0 flex flex-col">
         <div
-          className="flex-1 min-h-0 relative overflow-hidden"
+          className="flex-1 min-h-0 relative"
           data-preview-pan-surface="true"
           onDragOver={handlePreviewDragOver}
           onDragLeave={handlePreviewDragLeave}
           onDrop={handlePreviewDrop}
         >
-          <NLEPreview
-            projectId={projectId}
-            iframeRef={iframeRef}
-            onIframeLoad={onIframeLoad}
-            onCompositionLoadingChange={setCompositionLoading}
-            portrait={portrait}
-            directUrl={directUrl}
-            suppressLoadingOverlay={hasLoadedOnceRef.current}
-            onStageRef={handleStageRef}
-          />
-          {previewDragOver && (
-            <div className="absolute inset-2 z-40 rounded-lg border-2 border-dashed border-studio-accent/50 bg-studio-accent/[0.04] pointer-events-none" />
-          )}
+          <div className="absolute inset-0 overflow-hidden">
+            <NLEPreview
+              projectId={projectId}
+              iframeRef={iframeRef}
+              onIframeLoad={onIframeLoad}
+              onCompositionLoadingChange={setCompositionLoading}
+              portrait={portrait}
+              directUrl={directUrl}
+              suppressLoadingOverlay={hasLoadedOnceRef.current}
+              onStageRef={handleStageRef}
+            />
+            {previewDragOver && (
+              <div className="absolute inset-2 z-40 rounded-lg border-2 border-dashed border-studio-accent/50 bg-studio-accent/[0.04] pointer-events-none" />
+            )}
+          </div>
           {!isFullscreen && previewOverlay}
         </div>
         <div className="bg-neutral-950 border-t border-neutral-800/50 flex-shrink-0">
@@ -456,16 +432,7 @@ export const NLELayout = memo(function NLELayout({
                 onDeleteElement={onDeleteElement}
                 onAssetDrop={onAssetDrop}
                 onBlockDrop={onBlockDrop}
-                onMoveElement={onMoveElement}
-                onResizeElement={onResizeElement}
-                onBlockedEditAttempt={onBlockedEditAttempt}
-                onSplitElement={onSplitElement}
                 onSelectElement={onSelectTimelineElement}
-                onDeleteKeyframe={onDeleteKeyframe}
-                onDeleteAllKeyframes={onDeleteAllKeyframes}
-                onChangeKeyframeEase={onChangeKeyframeEase}
-                onMoveKeyframe={onMoveKeyframe}
-                onToggleKeyframeAtPlayhead={onToggleKeyframeAtPlayhead}
               />
             </div>
             {timelineFooter && <div className="flex-shrink-0">{timelineFooter}</div>}

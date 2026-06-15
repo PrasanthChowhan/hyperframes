@@ -1,13 +1,16 @@
 import { useRef, useMemo, useCallback, useState, useEffect, memo, type ReactNode } from "react";
+import { useMusicBeatAnalysis } from "../../hooks/useMusicBeatAnalysis";
+import { isMusicTrack } from "../../utils/timelineInspector";
+import { remapBeatAnalysisToComposition } from "../../utils/beatEditActions";
 import { usePlayerStore, type TimelineElement } from "../store/playerStore";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { EditPopover } from "./EditModal";
-import { type BlockedTimelineEditIntent } from "./timelineEditing";
 import { defaultTimelineTheme, type TimelineTheme } from "./timelineTheme";
 import { useTimelineRangeSelection } from "./useTimelineRangeSelection";
 import { useTimelinePlayhead } from "./useTimelinePlayhead";
 import { type TrackVisualStyle, getTrackStyle } from "./timelineIcons";
 import { getTimelinePixelsPerSecond } from "./timelineZoom";
+import { useTimelineZoom } from "./useTimelineZoom";
 import { useTimelineAssetDrop } from "./timelineDragDrop";
 import { TimelineEmptyState } from "./TimelineEmptyState";
 import { TimelineCanvas } from "./TimelineCanvas";
@@ -16,6 +19,7 @@ import {
   type KeyframeDiamondContextMenuState,
 } from "./KeyframeDiamondContextMenu";
 import { useTimelineClipDrag } from "./useTimelineClipDrag";
+import { snapKeyframePctToBeat } from "./timelineEditing";
 import { ClipContextMenu } from "./ClipContextMenu";
 import {
   GUTTER,
@@ -23,6 +27,8 @@ import {
   getTimelineCanvasHeight,
   shouldShowTimelineShortcutHint,
 } from "./timelineLayout";
+import type { TimelineDropCallbacks } from "./timelineCallbacks";
+import { useTimelineEditContext } from "../../contexts/TimelineEditContext";
 
 // Re-export pure utilities so existing imports from "./Timeline" still resolve.
 export {
@@ -39,7 +45,7 @@ export {
   getDefaultDroppedTrack,
 } from "./timelineLayout";
 
-interface TimelineProps {
+interface TimelineProps extends TimelineDropCallbacks {
   onSeek?: (time: number) => void;
   onDrillDown?: (element: TimelineElement) => void;
   renderClipContent?: (
@@ -47,35 +53,8 @@ interface TimelineProps {
     style: { clip: string; label: string },
   ) => ReactNode;
   renderClipOverlay?: (element: TimelineElement) => ReactNode;
-  onFileDrop?: (
-    files: File[],
-    placement?: { start: number; track: number },
-  ) => Promise<void> | void;
-  onAssetDrop?: (
-    assetPath: string,
-    placement: { start: number; track: number },
-  ) => Promise<void> | void;
-  onBlockDrop?: (
-    blockName: string,
-    placement: { start: number; track: number },
-  ) => Promise<void> | void;
   onDeleteElement?: (element: TimelineElement) => Promise<void> | void;
-  onMoveElement?: (
-    element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "track">,
-  ) => Promise<void> | void;
-  onResizeElement?: (
-    element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "duration" | "playbackStart">,
-  ) => Promise<void> | void;
-  onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedTimelineEditIntent) => void;
-  onSplitElement?: (element: TimelineElement, splitTime: number) => Promise<void> | void;
   onSelectElement?: (element: TimelineElement | null) => void;
-  onDeleteKeyframe?: (elementId: string, percentage: number) => void;
-  onDeleteAllKeyframes?: (elementId: string) => void;
-  onChangeKeyframeEase?: (elementId: string, percentage: number, ease: string) => void;
-  onMoveKeyframe?: (element: TimelineElement, oldPct: number, newPct: number) => void;
-  onToggleKeyframeAtPlayhead?: (element: TimelineElement) => void;
   theme?: Partial<TimelineTheme>;
 }
 
@@ -88,36 +67,47 @@ export const Timeline = memo(function Timeline({
   onAssetDrop,
   onBlockDrop,
   onDeleteElement: _onDeleteElement,
-  onMoveElement,
-  onResizeElement,
-  onBlockedEditAttempt,
-  onSplitElement,
   onSelectElement,
-  onDeleteKeyframe,
-  onDeleteAllKeyframes,
-  onChangeKeyframeEase,
-  onMoveKeyframe,
-  onToggleKeyframeAtPlayhead,
   theme: themeOverrides,
 }: TimelineProps = {}) {
+  const {
+    onMoveElement,
+    onResizeElement,
+    onBlockedEditAttempt,
+    onSplitElement,
+    onRazorSplitAll,
+    onDeleteKeyframe,
+    onDeleteAllKeyframes,
+    onChangeKeyframeEase,
+    onMoveKeyframe,
+  } = useTimelineEditContext();
   const theme = useMemo(() => ({ ...defaultTimelineTheme, ...themeOverrides }), [themeOverrides]);
+  useMusicBeatAnalysis();
   const elements = usePlayerStore((s) => s.elements);
+  const beatAnalysis = usePlayerStore((s) => s.beatAnalysis);
+  const musicElement = usePlayerStore((s) => s.elements.find(isMusicTrack) ?? null);
+
+  // Merge user edits + remap beats from audio-file → composition coordinates.
+  const beatEdits = usePlayerStore((s) => s.beatEdits);
+  const adjustedBeatAnalysis = useMemo(
+    () => remapBeatAnalysisToComposition(beatAnalysis, musicElement, beatEdits),
+    [beatAnalysis, musicElement, beatEdits],
+  );
   const duration = usePlayerStore((s) => s.duration);
   const timelineReady = usePlayerStore((s) => s.timelineReady);
   const selectedElementId = usePlayerStore((s) => s.selectedElementId);
   const setSelectedElementId = usePlayerStore((s) => s.setSelectedElementId);
   const currentTime = usePlayerStore((s) => s.currentTime);
-  const zoomMode = usePlayerStore((s) => s.zoomMode);
-  const manualZoomPercent = usePlayerStore((s) => s.manualZoomPercent);
-  const setZoomMode = usePlayerStore((s) => s.setZoomMode);
-  const setManualZoomPercent = usePlayerStore((s) => s.setManualZoomPercent);
+  const { zoomMode, manualZoomPercent, setZoomMode, setManualZoomPercent } = useTimelineZoom();
 
   const playheadRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const activeTool = usePlayerStore((s) => s.activeTool);
   const [hoveredClip, setHoveredClip] = useState<string | null>(null);
   const isDragging = useRef(false);
   const [shiftHeld, setShiftHeld] = useState(false);
+  const [razorGuideX, setRazorGuideX] = useState<number | null>(null);
 
   useMountEffect(() => {
     const down = (e: KeyboardEvent) => e.key === "Shift" && setShiftHeld(true);
@@ -388,7 +378,14 @@ export const Timeline = memo(function Timeline({
     <div
       ref={setContainerRef}
       aria-label="Timeline"
-      className={`relative border-t select-none h-full overflow-hidden ${shiftHeld ? "cursor-crosshair" : "cursor-default"}`}
+      className={`relative border-t select-none h-full overflow-hidden ${activeTool === "razor" ? "cursor-crosshair" : shiftHeld ? "cursor-crosshair" : "cursor-default"}`}
+      onMouseMove={(e) => {
+        if (activeTool === "razor" && scrollRef.current) {
+          const rect = scrollRef.current.getBoundingClientRect();
+          setRazorGuideX(e.clientX - rect.left + scrollRef.current.scrollLeft);
+        }
+      }}
+      onMouseLeave={() => setRazorGuideX(null)}
       style={{
         touchAction: "pan-x pan-y",
         background: theme.shellBackground,
@@ -402,7 +399,16 @@ export const Timeline = memo(function Timeline({
         onDragOver={handleAssetDragOver}
         onDragLeave={() => setIsDragOver(false)}
         onDrop={handleAssetDrop}
-        onPointerDown={handlePointerDown}
+        onPointerDown={(e) => {
+          if (activeTool === "razor" && e.shiftKey && e.button === 0 && scrollRef.current) {
+            const rect = scrollRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left + scrollRef.current.scrollLeft - GUTTER;
+            const splitTime = Math.max(0, x / pps);
+            onRazorSplitAll?.(splitTime);
+            return;
+          }
+          handlePointerDown(e);
+        }}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onLostPointerCapture={handlePointerUp}
@@ -432,8 +438,6 @@ export const Timeline = memo(function Timeline({
           renderClipContent={renderClipContent}
           renderClipOverlay={renderClipOverlay}
           playheadRef={playheadRef}
-          onResizeElement={onResizeElement}
-          onMoveElement={onMoveElement}
           onDrillDown={onDrillDown}
           onSelectElement={onSelectElement}
           setHoveredClip={setHoveredClip}
@@ -449,7 +453,7 @@ export const Timeline = memo(function Timeline({
           keyframeCache={keyframeCache}
           selectedKeyframes={selectedKeyframes}
           currentTime={currentTime}
-          onToggleKeyframeAtPlayhead={onToggleKeyframeAtPlayhead}
+          beatAnalysis={adjustedBeatAnalysis}
           onClickKeyframe={(el, pct) => {
             usePlayerStore.getState().clearSelectedKeyframes();
             const elKey = el.key ?? el.id;
@@ -457,12 +461,25 @@ export const Timeline = memo(function Timeline({
             onSelectElement?.(el);
             const absTime = el.start + (pct / 100) * el.duration;
             onSeek?.(absTime);
+            const kfData = keyframeCache?.get(elKey);
+            const kf = kfData?.keyframes.find((k) => Math.abs(k.percentage - pct) < 0.5);
+            usePlayerStore.getState().setActiveKeyframePct(kf?.tweenPercentage ?? null);
           }}
           onShiftClickKeyframe={(elId, pct) => {
             toggleSelectedKeyframe(`${elId}:${pct}`);
           }}
           onDragKeyframe={(el, oldPct, newPct) => {
             onMoveKeyframe?.(el, oldPct, newPct);
+          }}
+          onSnapKeyframePct={(el, pct) =>
+            snapKeyframePctToBeat(el, pct, adjustedBeatAnalysis?.beatTimes, pps)
+          }
+          onPickKeyframeElement={(el) => {
+            const elKey = el.key ?? el.id;
+            if (selectedElementId !== elKey) {
+              setSelectedElementId(elKey);
+              onSelectElement?.(el);
+            }
           }}
           onContextMenuKeyframe={(e, elId, pct) => {
             const el = elements.find((x) => (x.key ?? x.id) === elId);
@@ -473,12 +490,13 @@ export const Timeline = memo(function Timeline({
               onSeek?.(absTime);
             }
             const kfData = keyframeCache.get(elId);
-            const kf = kfData?.keyframes.find((k) => k.percentage === pct);
+            const kf = kfData?.keyframes.find((k) => Math.abs(k.percentage - pct) < 0.2);
             setKfContextMenu({
-              x: e.clientX,
-              y: e.clientY,
+              x: e.clientX + 4,
+              y: e.clientY + 2,
               elementId: elId,
               percentage: pct,
+              tweenPercentage: kf?.tweenPercentage,
               currentEase: kf?.ease ?? kfData?.ease,
             });
           }}
@@ -489,6 +507,16 @@ export const Timeline = memo(function Timeline({
             setClipContextMenu({ x: e.clientX, y: e.clientY, element: el });
           }}
         />
+        {activeTool === "razor" && razorGuideX !== null && (
+          <div
+            className="absolute top-0 bottom-0 pointer-events-none z-10"
+            style={{
+              left: razorGuideX,
+              width: 1,
+              background: "rgba(239,68,68,0.7)",
+            }}
+          />
+        )}
       </div>
 
       {showShortcutHint && !showPopover && !rangeSelection && (

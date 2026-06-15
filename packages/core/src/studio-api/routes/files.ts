@@ -16,13 +16,21 @@ import type { StudioApiAdapter } from "../types.js";
 import { isAudioFile } from "../helpers/mime.js";
 import { generateWaveformCache } from "../helpers/waveform.js";
 import { validateUploadedMediaBuffer } from "../helpers/mediaValidation.js";
-import { isSafePath } from "../helpers/safePath.js";
+import { isSafePath, resolveWithinProject } from "../helpers/safePath.js";
+import { backupPathForResponse, snapshotBeforeWrite } from "../helpers/backupJournal.js";
+import {
+  findUnsafeDomPatchValues,
+  findUnsafeMutationValues,
+  type UnsafeMutationValue,
+} from "../helpers/finiteMutation.js";
 import type { GsapAnimation } from "../../parsers/gsapSerialize.js";
+import { parseGsapScriptAcorn } from "../../parsers/gsapParserAcorn.js";
 import {
   removeElementFromHtml,
   patchElementInHtml,
   probeElementInSource,
   splitElementInHtml,
+  isHTMLElement,
   type PatchOperation,
 } from "../helpers/sourceMutation.js";
 import { parseHTML } from "linkedom";
@@ -60,8 +68,8 @@ async function resolveProjectPath(
     return { error: c.json({ error: "forbidden" }, 403) } as const;
   }
 
-  const absPath = resolve(project.dir, filePath);
-  if (!isSafePath(project.dir, absPath)) {
+  const absPath = resolveWithinProject(project.dir, filePath);
+  if (!absPath) {
     return { error: c.json({ error: "forbidden" }, 403) } as const;
   }
 
@@ -84,20 +92,49 @@ function resolveFileMutationContext(c: RouteContext, adapter: StudioApiAdapter, 
   return resolveProjectPath(c, adapter, (id) => `/projects/${id}/file-mutations/${operation}/`);
 }
 
-type MutationTarget = { id?: string | null; selector?: string; selectorIndex?: number };
+type MutationTarget = {
+  id?: string | null;
+  hfId?: string;
+  selector?: string;
+  selectorIndex?: number;
+};
 
 /** Write `next` to `absPath` only if it differs from `original`, returning a standardized change response. */
 function writeIfChanged(
   c: RouteContext,
+  projectDir: string,
+  filePath: string,
   absPath: string,
   original: string,
   next: string,
 ): Response {
   if (next === original) {
-    return c.json({ ok: true, changed: false, content: original });
+    return c.json({ ok: true, changed: false, content: original, path: filePath });
   }
+  const backup = snapshotBeforeWrite(projectDir, absPath);
+  if (backup.error) console.warn(`Failed to create backup for ${filePath}: ${backup.error}`);
   writeFileSync(absPath, next, "utf-8");
-  return c.json({ ok: true, changed: true, content: next });
+  return c.json({
+    ok: true,
+    changed: true,
+    content: next,
+    path: filePath,
+    backupPath: backupPathForResponse(projectDir, backup.backupPath),
+  });
+}
+
+function rejectUnsafeMutationValues(
+  c: RouteContext,
+  unsafeFields: UnsafeMutationValue[],
+): Response {
+  return c.json(
+    {
+      error: "mutation contains unsafe values",
+      fields: unsafeFields.map((field) => field.path),
+      unsafeValues: unsafeFields,
+    },
+    400,
+  );
 }
 
 /**
@@ -192,15 +229,12 @@ function updateReferences(projectDir: string, oldPath: string, newPath: string):
  * contains GSAP timeline code, and return both its text content and a
  * function that replaces that script block and serialises back to HTML.
  */
-function extractGsapScriptBlock(
-  html: string,
-): { scriptText: string; replaceScript: (newText: string) => string } | null {
+function extractGsapScriptBlock(html: string): {
+  scriptText: string;
+  document: Document;
+  replaceScript: (newText: string) => string;
+} | null {
   const { document } = parseHTML(html);
-  // linkedom's querySelectorAll doesn't descend into <template> content, but
-  // sub-compositions wrap their markup (and the GSAP <script>) in a <template>.
-  // Search top-level scripts first, then each template's own scripts. Operate
-  // on the template element directly (NOT .content) so textContent writes are
-  // reflected in document.toString().
   const scripts = [
     ...document.querySelectorAll("script:not([src])"),
     ...Array.from(document.querySelectorAll("template")).flatMap((tmpl) =>
@@ -216,6 +250,7 @@ function extractGsapScriptBlock(
     ) {
       return {
         scriptText: content,
+        document,
         replaceScript(newText: string): string {
           script.textContent = newText;
           return document.toString();
@@ -226,9 +261,597 @@ function extractGsapScriptBlock(
   return null;
 }
 
-/** Lazy-load gsapParser to avoid pulling recast into every file-route import. */
+function stripStudioEditsFromTarget(document: Document, selector: string): number {
+  if (!selector) return 0;
+  let stripped = 0;
+  try {
+    for (const el of document.querySelectorAll(selector)) {
+      if (!el.getAttribute("data-hf-studio-path-offset")) continue;
+      if (!isHTMLElement(el)) continue;
+      const htmlEl = el;
+      const originalTranslate = el.getAttribute("data-hf-studio-original-inline-translate");
+      htmlEl.style.removeProperty("--hf-studio-offset-x");
+      htmlEl.style.removeProperty("--hf-studio-offset-y");
+      if (originalTranslate) {
+        htmlEl.style.setProperty("translate", originalTranslate);
+      } else {
+        htmlEl.style.removeProperty("translate");
+      }
+      el.removeAttribute("data-hf-studio-path-offset");
+      el.removeAttribute("data-hf-studio-original-translate");
+      el.removeAttribute("data-hf-studio-original-inline-translate");
+      stripped++;
+    }
+  } catch {
+    // Invalid selector — skip silently.
+  }
+  return stripped;
+}
+
+function lastKeyframeOpacity(kfs: GsapAnimation["keyframes"]): number | string | undefined {
+  if (!kfs) return undefined;
+  for (let i = kfs.keyframes.length - 1; i >= 0; i--) {
+    if ("opacity" in kfs.keyframes[i]!.properties) return kfs.keyframes[i]!.properties.opacity;
+  }
+  return undefined;
+}
+
+function resolveFinalOpacity(anim: GsapAnimation): number | null {
+  if (anim.method === "from") return null;
+  const raw = anim.keyframes ? lastKeyframeOpacity(anim.keyframes) : anim.properties.opacity;
+  if (raw == null) return null;
+  if (typeof raw === "string" && /^[+\-*]=/.test(raw)) return null;
+  const num = Number(raw);
+  return Number.isFinite(num) && num !== 0 ? num : null;
+}
+
+function bakeVisibilityOnDelete(document: Document, anim: GsapAnimation): void {
+  const opacity = resolveFinalOpacity(anim);
+  if (opacity === null) return;
+  try {
+    for (const el of document.querySelectorAll(anim.targetSelector)) {
+      if (isHTMLElement(el)) el.style.setProperty("opacity", String(opacity));
+    }
+  } catch {
+    // Invalid selector — skip silently.
+  }
+}
+
+/**
+ * Lazy-load gsapParser for write ops (recast-backed) that are not yet ported to
+ * the acorn writer. The read path (`parseGsapScript`) has been replaced by the
+ * browser-safe `parseGsapScriptAcorn` — this loader is only needed for the write
+ * ops that remain: convertToKeyframesInScript, removeAllKeyframesFromScript,
+ * materializeKeyframesInScript, unrollDynamicAnimations, setArcPathInScript, etc.
+ */
 async function loadGsapParser() {
   return import("../../parsers/gsapParser.js");
+}
+
+// ── GSAP mutation types ─────────────────────────────────────────────────────
+
+type GsapMutationRequest =
+  | {
+      type: "update-property";
+      animationId: string;
+      property: string;
+      value: number | string;
+    }
+  | {
+      type: "update-from-property";
+      animationId: string;
+      property: string;
+      value: number | string;
+    }
+  | {
+      type: "update-meta";
+      animationId: string;
+      updates: { duration?: number; ease?: string; position?: number };
+    }
+  | {
+      type: "add";
+      targetSelector: string;
+      method: "to" | "from" | "set" | "fromTo";
+      position: number;
+      duration?: number;
+      ease?: string;
+      properties: Record<string, number | string>;
+      fromProperties?: Record<string, number | string>;
+    }
+  | { type: "delete"; animationId: string; stripStudioEdits?: boolean }
+  | {
+      type: "add-property";
+      animationId: string;
+      property: string;
+      defaultValue: number | string;
+    }
+  | {
+      type: "add-from-property";
+      animationId: string;
+      property: string;
+      defaultValue: number | string;
+    }
+  | { type: "remove-property"; animationId: string; property: string }
+  | { type: "remove-from-property"; animationId: string; property: string }
+  | {
+      type: "add-keyframe";
+      animationId: string;
+      percentage: number;
+      properties: Record<string, number | string>;
+      ease?: string;
+      backfillDefaults?: Record<string, number | string>;
+    }
+  | { type: "remove-keyframe"; animationId: string; percentage: number }
+  | {
+      type: "update-keyframe";
+      animationId: string;
+      percentage: number;
+      properties: Record<string, number | string>;
+      ease?: string;
+    }
+  | {
+      type: "convert-to-keyframes";
+      animationId: string;
+      resolvedFromValues?: Record<string, number | string>;
+    }
+  | { type: "remove-all-keyframes"; animationId: string }
+  | {
+      type: "materialize-keyframes";
+      animationId: string;
+      keyframes: Array<{
+        percentage: number;
+        properties: Record<string, number | string>;
+        ease?: string;
+      }>;
+      easeEach?: string;
+      resolvedSelector?: string;
+      allElements?: Array<{
+        selector: string;
+        keyframes: Array<{ percentage: number; properties: Record<string, number | string> }>;
+        easeEach?: string;
+      }>;
+    }
+  | {
+      type: "set-arc-path";
+      animationId: string;
+      enabled: boolean;
+      autoRotate?: boolean | number;
+      segments?: Array<{
+        curviness: number;
+        cp1?: { x: number; y: number };
+        cp2?: { x: number; y: number };
+      }>;
+    }
+  | {
+      type: "update-arc-segment";
+      animationId: string;
+      segmentIndex: number;
+      curviness?: number;
+      cp1?: { x: number; y: number };
+      cp2?: { x: number; y: number };
+    }
+  | { type: "remove-arc-path"; animationId: string }
+  | {
+      type: "add-with-keyframes";
+      targetSelector: string;
+      position: number;
+      duration: number;
+      keyframes: Array<{
+        percentage: number;
+        properties: Record<string, number | string>;
+        ease?: string;
+        auto?: boolean;
+      }>;
+      ease?: string;
+    }
+  | {
+      type: "replace-with-keyframes";
+      animationId: string;
+      targetSelector: string;
+      position: number;
+      duration: number;
+      keyframes: Array<{
+        percentage: number;
+        properties: Record<string, number | string>;
+        ease?: string;
+        auto?: boolean;
+      }>;
+      ease?: string;
+    }
+  | {
+      type: "split-animations";
+      originalId: string;
+      newId: string;
+      splitTime: number;
+      elementStart: number;
+      elementDuration: number;
+    }
+  | {
+      type: "split-into-property-groups";
+      animationId: string;
+    }
+  | {
+      type: "delete-all-for-selector";
+      targetSelector: string;
+    }
+  | {
+      type: "shift-positions";
+      targetSelector: string;
+      delta: number;
+    }
+  | {
+      type: "scale-positions";
+      targetSelector: string;
+      oldStart: number;
+      oldDuration: number;
+      newStart: number;
+      newDuration: number;
+    };
+
+// ── GSAP mutation executor ──────────────────────────────────────────────────
+
+type GsapMutationResult = string | { script: string; skippedSelectors: string[] };
+
+async function executeGsapMutation(
+  body: GsapMutationRequest,
+  block: NonNullable<ReturnType<typeof extractGsapScriptBlock>>,
+  respond: (data: unknown, status?: number) => Response,
+): Promise<GsapMutationResult | Response> {
+  const parser = await loadGsapParser();
+  const {
+    updateAnimationInScript,
+    addAnimationToScript,
+    removeAnimationFromScript,
+    addKeyframeToScript,
+    removeKeyframeFromScript,
+    updateKeyframeInScript,
+    convertToKeyframesInScript,
+    removeAllKeyframesFromScript,
+    materializeKeyframesInScript,
+    unrollDynamicAnimations,
+    setArcPathInScript,
+    updateArcSegmentInScript,
+    removeArcPathFromScript,
+    addAnimationWithKeyframesToScript,
+    splitAnimationsInScript,
+    splitIntoPropertyGroups,
+  } = parser;
+
+  function requireAnimation(
+    scriptText: string,
+    animationId: string,
+  ): { anim: GsapAnimation } | { err: Response } {
+    const parsed = parseGsapScriptAcorn(scriptText);
+    const anim = parsed.animations.find((a) => a.id === animationId);
+    if (!anim) return { err: respond({ error: "animation not found" }, 404) };
+    return { anim };
+  }
+
+  function requireFromToAnimation(
+    scriptText: string,
+    animationId: string,
+  ): { anim: GsapAnimation } | { err: Response } {
+    const result = requireAnimation(scriptText, animationId);
+    if ("err" in result) return result;
+    if (result.anim.method !== "fromTo")
+      return { err: respond({ error: "animation is not a fromTo" }, 400) };
+    return result;
+  }
+
+  switch (body.type) {
+    case "update-property":
+    case "add-property": {
+      const r = requireAnimation(block.scriptText, body.animationId);
+      if ("err" in r) return r.err;
+      const val = body.type === "update-property" ? body.value : body.defaultValue;
+      return updateAnimationInScript(block.scriptText, body.animationId, {
+        properties: { ...r.anim.properties, [body.property]: val },
+      });
+    }
+    case "update-from-property":
+    case "add-from-property": {
+      const r = requireFromToAnimation(block.scriptText, body.animationId);
+      if ("err" in r) return r.err;
+      const val = body.type === "update-from-property" ? body.value : body.defaultValue;
+      return updateAnimationInScript(block.scriptText, body.animationId, {
+        fromProperties: { ...(r.anim.fromProperties ?? {}), [body.property]: val },
+      });
+    }
+    case "update-meta": {
+      return updateAnimationInScript(block.scriptText, body.animationId, body.updates);
+    }
+    case "add": {
+      if (body.fromProperties && body.method !== "fromTo") {
+        return respond({ error: "fromProperties is only valid for method=fromTo" }, 400);
+      }
+      const result = addAnimationToScript(block.scriptText, {
+        targetSelector: body.targetSelector,
+        method: body.method,
+        position: body.position,
+        duration: body.duration,
+        ease: body.ease,
+        properties: body.properties,
+        fromProperties: body.fromProperties,
+      });
+      return result.script;
+    }
+    case "delete": {
+      const delTarget = requireAnimation(block.scriptText, body.animationId);
+      if (!("err" in delTarget) && body.stripStudioEdits) {
+        stripStudioEditsFromTarget(block.document, delTarget.anim.targetSelector);
+        bakeVisibilityOnDelete(block.document, delTarget.anim);
+      }
+      return removeAnimationFromScript(block.scriptText, body.animationId);
+    }
+    case "delete-all-for-selector": {
+      const parsed = parseGsapScriptAcorn(block.scriptText);
+      const matching = parsed.animations.filter((a) => a.targetSelector === body.targetSelector);
+      if (matching.length === 0) return block.scriptText;
+      stripStudioEditsFromTarget(block.document, body.targetSelector);
+      let script = block.scriptText;
+      for (const anim of matching.reverse()) {
+        script = removeAnimationFromScript(script, anim.id);
+      }
+      return script;
+    }
+    case "remove-property": {
+      const r = requireAnimation(block.scriptText, body.animationId);
+      if ("err" in r) return r.err;
+      const filtered = { ...r.anim.properties };
+      delete filtered[body.property];
+      return updateAnimationInScript(block.scriptText, body.animationId, {
+        properties: filtered,
+      });
+    }
+    case "remove-from-property": {
+      const r = requireFromToAnimation(block.scriptText, body.animationId);
+      if ("err" in r) return r.err;
+      const filtered = { ...(r.anim.fromProperties ?? {}) };
+      delete filtered[body.property];
+      return updateAnimationInScript(block.scriptText, body.animationId, {
+        fromProperties: filtered,
+      });
+    }
+    case "add-keyframe": {
+      return addKeyframeToScript(
+        block.scriptText,
+        body.animationId,
+        body.percentage,
+        body.properties,
+        body.ease,
+        body.backfillDefaults,
+      );
+    }
+    case "remove-keyframe": {
+      return removeKeyframeFromScript(block.scriptText, body.animationId, body.percentage);
+    }
+    case "update-keyframe": {
+      return updateKeyframeInScript(
+        block.scriptText,
+        body.animationId,
+        body.percentage,
+        body.properties,
+        body.ease,
+      );
+    }
+    case "convert-to-keyframes": {
+      return convertToKeyframesInScript(
+        block.scriptText,
+        body.animationId,
+        body.resolvedFromValues,
+      );
+    }
+    case "remove-all-keyframes": {
+      const preCollapse = requireAnimation(block.scriptText, body.animationId);
+      if (!("err" in preCollapse)) {
+        bakeVisibilityOnDelete(block.document, preCollapse.anim);
+      }
+      return removeAllKeyframesFromScript(block.scriptText, body.animationId);
+    }
+    case "materialize-keyframes": {
+      if (body.allElements && body.allElements.length > 0) {
+        return unrollDynamicAnimations(block.scriptText, body.animationId, body.allElements);
+      }
+      return materializeKeyframesInScript(
+        block.scriptText,
+        body.animationId,
+        body.keyframes,
+        body.easeEach,
+        body.resolvedSelector,
+      );
+    }
+    case "set-arc-path": {
+      return setArcPathInScript(block.scriptText, body.animationId, {
+        enabled: body.enabled,
+        autoRotate: body.autoRotate ?? false,
+        segments: body.segments ?? [],
+      });
+    }
+    case "update-arc-segment": {
+      return updateArcSegmentInScript(block.scriptText, body.animationId, body.segmentIndex, {
+        ...(body.curviness !== undefined ? { curviness: body.curviness } : {}),
+        ...(body.cp1 ? { cp1: body.cp1 } : {}),
+        ...(body.cp2 ? { cp2: body.cp2 } : {}),
+      });
+    }
+    case "remove-arc-path": {
+      return removeArcPathFromScript(block.scriptText, body.animationId);
+    }
+    case "add-with-keyframes": {
+      const result = addAnimationWithKeyframesToScript(
+        block.scriptText,
+        body.targetSelector,
+        body.position,
+        body.duration,
+        body.keyframes,
+        body.ease,
+      );
+      return result.script;
+    }
+    case "replace-with-keyframes": {
+      const script = removeAnimationFromScript(block.scriptText, body.animationId);
+      const added = addAnimationWithKeyframesToScript(
+        script,
+        body.targetSelector,
+        body.position,
+        body.duration,
+        body.keyframes,
+        body.ease,
+      );
+      return added.script;
+    }
+    case "split-animations": {
+      if (
+        typeof body.originalId !== "string" ||
+        !body.originalId ||
+        typeof body.newId !== "string" ||
+        !body.newId ||
+        typeof body.splitTime !== "number" ||
+        !Number.isFinite(body.splitTime) ||
+        typeof body.elementStart !== "number" ||
+        !Number.isFinite(body.elementStart) ||
+        typeof body.elementDuration !== "number" ||
+        !Number.isFinite(body.elementDuration) ||
+        body.elementDuration <= 0
+      ) {
+        return respond(
+          {
+            error:
+              "split-animations requires originalId, newId (non-empty strings), splitTime, elementStart (finite numbers), and elementDuration (positive number)",
+          },
+          400,
+        );
+      }
+      return splitAnimationsInScript(block.scriptText, {
+        originalId: body.originalId,
+        newId: body.newId,
+        splitTime: body.splitTime,
+        elementStart: body.elementStart,
+        elementDuration: body.elementDuration,
+      });
+    }
+    case "split-into-property-groups": {
+      const result = splitIntoPropertyGroups(block.scriptText, body.animationId);
+      return result.script;
+    }
+    case "shift-positions": {
+      const { targetSelector, delta } = body;
+      if (!targetSelector || !Number.isFinite(delta) || delta === 0) return block.scriptText;
+      const { shiftPositionsInScript } = parser;
+      return shiftPositionsInScript(block.scriptText, targetSelector, delta);
+    }
+    case "scale-positions": {
+      const { targetSelector, oldStart, oldDuration, newStart, newDuration } = body;
+      if (
+        !targetSelector ||
+        !Number.isFinite(oldStart) ||
+        !Number.isFinite(oldDuration) ||
+        !Number.isFinite(newStart) ||
+        !Number.isFinite(newDuration) ||
+        oldDuration <= 0 ||
+        newDuration <= 0
+      )
+        return block.scriptText;
+      if (oldStart === newStart && oldDuration === newDuration) return block.scriptText;
+      const { scalePositionsInScript } = parser;
+      return scalePositionsInScript(
+        block.scriptText,
+        targetSelector,
+        oldStart,
+        oldDuration,
+        newStart,
+        newDuration,
+      );
+    }
+    default:
+      return respond({ error: `unknown mutation type: ${(body as { type: string }).type}` }, 400);
+  }
+}
+
+// ── Upload file processing ──────────────────────────────────────────────────
+
+async function processUploadedFiles(
+  formData: FormData,
+  targetDir: string,
+  projectDir: string,
+): Promise<{
+  uploaded: string[];
+  skipped: string[];
+  invalid: Array<{ name: string; reason: string }>;
+}> {
+  const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB per file
+  const uploaded: string[] = [];
+  const skipped: string[] = [];
+  const invalid: Array<{ name: string; reason: string }> = [];
+
+  // @types/node v25 narrows the ambient `FormData.entries()` to
+  // `[string, string]` in workspaces where another dep declares an
+  // `onmessage` global (it trips the worker branch of v25's conditional
+  // File type). At runtime the value is still `File | string` — cast the
+  // iterator so the rest of this block keeps type-checking on every
+  // bun-install layout (hoisted on Windows surfaces this; isolated on
+  // Linux happens to keep v24 in scope).
+  type FileLike = {
+    readonly name: string;
+    readonly size: number;
+    arrayBuffer(): Promise<ArrayBuffer>;
+  };
+  const entries = formData.entries() as unknown as Iterable<[string, FileLike | string]>;
+
+  // Derive the subdirectory prefix from targetDir relative to projectDir
+  const subDir = targetDir === projectDir ? "" : targetDir.slice(projectDir.length + 1);
+
+  for (const [, value] of entries) {
+    if (typeof value === "string") continue;
+
+    // Strip path separators — browsers may include directory components
+    const name = value.name.split("/").pop()?.split("\\").pop() ?? "";
+    if (!name || name.includes("\0") || name.includes("..")) continue;
+
+    // Reject individual files that exceed the size limit
+    if (value.size > MAX_UPLOAD_BYTES) {
+      skipped.push(name);
+      continue;
+    }
+
+    const destPath = resolve(targetDir, name);
+    if (!isSafePath(projectDir, destPath)) continue;
+
+    // Don't overwrite — append (2), (3), etc.
+    let finalPath = destPath;
+    let finalName = name;
+    if (existsSync(finalPath)) {
+      // Handle dotfiles correctly: .gitignore → ext="", base=".gitignore"
+      const dotIdx = name.indexOf(".", name.startsWith(".") ? 1 : 0);
+      const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
+      const base = dotIdx > 0 ? name.slice(0, dotIdx) : name;
+      let n = 2;
+      const MAX_COPY_INDEX = 10000;
+      while (n < MAX_COPY_INDEX && existsSync(resolve(targetDir, `${base} (${n})${ext}`))) n++;
+      if (n >= MAX_COPY_INDEX) {
+        skipped.push(name);
+        continue;
+      }
+      finalName = `${base} (${n})${ext}`;
+      finalPath = resolve(targetDir, finalName);
+    }
+
+    const buffer = Buffer.from(await value.arrayBuffer());
+    const validation = validateUploadedMediaBuffer(finalName, buffer);
+    if (!validation.ok) {
+      invalid.push({ name: finalName, reason: validation.reason });
+      continue;
+    }
+
+    writeFileSync(finalPath, buffer);
+    const relativePath = subDir ? join(subDir, finalName) : finalName;
+    uploaded.push(relativePath);
+    if (isAudioFile(finalName)) {
+      generateWaveformCache(projectDir, relativePath).catch(() => {});
+    }
+  }
+
+  return { uploaded, skipped, invalid };
 }
 
 // ── Route registration ──────────────────────────────────────────────────────
@@ -259,9 +882,15 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
 
     ensureDir(res.absPath);
     const body = await c.req.text();
+    const backup = snapshotBeforeWrite(res.project.dir, res.absPath);
+    if (backup.error) console.warn(`Failed to create backup for ${res.filePath}: ${backup.error}`);
     writeFileSync(res.absPath, body, "utf-8");
 
-    return c.json({ ok: true });
+    return c.json({
+      ok: true,
+      path: res.filePath,
+      backupPath: backupPathForResponse(res.project.dir, backup.backupPath),
+    });
   });
 
   // ── Create (fail if exists) ──
@@ -288,13 +917,18 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
     if ("error" in res) return res.error;
 
     const stat = statSync(res.absPath);
+    const backup = snapshotBeforeWrite(res.project.dir, res.absPath);
+    if (backup.error) console.warn(`Failed to create backup for ${res.filePath}: ${backup.error}`);
     if (stat.isDirectory()) {
       rmSync(res.absPath, { recursive: true });
     } else {
       unlinkSync(res.absPath);
     }
 
-    return c.json({ ok: true });
+    return c.json({
+      ok: true,
+      backupPath: backupPathForResponse(res.project.dir, backup.backupPath),
+    });
   });
 
   api.post("/projects/:id/file-mutations/remove-element/*", async (c) => {
@@ -311,6 +945,8 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
     const originalContent = readFileSync(ctx.absPath, "utf-8");
     return writeIfChanged(
       c,
+      ctx.project.dir,
+      ctx.filePath,
       ctx.absPath,
       originalContent,
       removeElementFromHtml(originalContent, parsed.target),
@@ -344,10 +980,19 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       parsed.body.newId,
     );
     if (!result.matched) {
-      return c.json({ ok: false, changed: false, content: originalContent });
+      return c.json({ ok: false, changed: false, content: originalContent, path: ctx.filePath });
     }
+    const backup = snapshotBeforeWrite(ctx.project.dir, ctx.absPath);
+    if (backup.error) console.warn(`Failed to create backup for ${ctx.filePath}: ${backup.error}`);
     writeFileSync(ctx.absPath, result.html, "utf-8");
-    return c.json({ ok: true, changed: true, content: result.html, newId: result.newId });
+    return c.json({
+      ok: true,
+      changed: true,
+      content: result.html,
+      newId: result.newId,
+      path: ctx.filePath,
+      backupPath: backupPathForResponse(ctx.project.dir, backup.backupPath),
+    });
   });
 
   api.post("/projects/:id/file-mutations/patch-element/*", async (c) => {
@@ -362,6 +1007,10 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
     if (!Array.isArray(parsed.body.operations) || parsed.body.operations.length === 0) {
       return c.json({ error: "target and operations required" }, 400);
     }
+    const unsafeFields = findUnsafeDomPatchValues(parsed.body);
+    if (unsafeFields.length > 0) {
+      return rejectUnsafeMutationValues(c, unsafeFields);
+    }
 
     let originalContent: string;
     try {
@@ -375,10 +1024,25 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       parsed.body.operations,
     );
     if (patched === originalContent) {
-      return c.json({ ok: true, changed: false, matched, content: originalContent });
+      return c.json({
+        ok: true,
+        changed: false,
+        matched,
+        content: originalContent,
+        path: ctx.filePath,
+      });
     }
+    const backup = snapshotBeforeWrite(ctx.project.dir, ctx.absPath);
+    if (backup.error) console.warn(`Failed to create backup for ${ctx.filePath}: ${backup.error}`);
     writeFileSync(ctx.absPath, patched, "utf-8");
-    return c.json({ ok: true, changed: true, matched, content: patched });
+    return c.json({
+      ok: true,
+      changed: true,
+      matched,
+      content: patched,
+      path: ctx.filePath,
+      backupPath: backupPathForResponse(ctx.project.dir, backup.backupPath),
+    });
   });
 
   api.post("/projects/:id/file-mutations/probe-element/*", async (c) => {
@@ -410,8 +1074,8 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       return c.json({ error: "newPath required" }, 400);
     }
 
-    const newAbs = resolve(res.project.dir, body.newPath);
-    if (!isSafePath(res.project.dir, newAbs)) {
+    const newAbs = resolveWithinProject(res.project.dir, body.newPath);
+    if (!newAbs) {
       return c.json({ error: "forbidden" }, 403);
     }
     if (existsSync(newAbs)) {
@@ -438,14 +1102,14 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       return c.json({ error: "path required" }, 400);
     }
 
-    const srcAbs = resolve(project.dir, body.path);
-    if (!isSafePath(project.dir, srcAbs) || !existsSync(srcAbs)) {
+    const srcAbs = resolveWithinProject(project.dir, body.path);
+    if (!srcAbs || !existsSync(srcAbs)) {
       return c.json({ error: "not found" }, 404);
     }
 
     const copyPath = generateCopyPath(project.dir, body.path);
-    const destAbs = resolve(project.dir, copyPath);
-    if (!isSafePath(project.dir, destAbs)) {
+    const destAbs = resolveWithinProject(project.dir, copyPath);
+    if (!destAbs) {
       return c.json({ error: "forbidden" }, 403);
     }
 
@@ -471,77 +1135,17 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
 
       // Optional subdirectory within the project (e.g. "assets/audio")
       const subDir = c.req.query("dir") ?? "";
-      const targetDir = subDir ? resolve(project.dir, subDir) : project.dir;
-      if (!isSafePath(project.dir, targetDir)) return c.json({ error: "forbidden" }, 403);
+      const targetDir = subDir ? resolveWithinProject(project.dir, subDir) : project.dir;
+      if (!targetDir) return c.json({ error: "forbidden" }, 403);
       if (subDir && !existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
 
       const formData = await c.req.formData();
-      const uploaded: string[] = [];
-      const skipped: string[] = [];
-      const invalid: Array<{ name: string; reason: string }> = [];
+      const result = await processUploadedFiles(formData, targetDir, project.dir);
 
-      // @types/node v25 narrows the ambient `FormData.entries()` to
-      // `[string, string]` in workspaces where another dep declares an
-      // `onmessage` global (it trips the worker branch of v25's conditional
-      // File type). At runtime the value is still `File | string` — cast the
-      // iterator so the rest of this block keeps type-checking on every
-      // bun-install layout (hoisted on Windows surfaces this; isolated on
-      // Linux happens to keep v24 in scope).
-      type FileLike = {
-        readonly name: string;
-        readonly size: number;
-        arrayBuffer(): Promise<ArrayBuffer>;
-      };
-      const entries = formData.entries() as unknown as Iterable<[string, FileLike | string]>;
-      for (const [, value] of entries) {
-        if (typeof value === "string") continue;
-
-        // Strip path separators — browsers may include directory components
-        const name = value.name.split("/").pop()?.split("\\").pop() ?? "";
-        if (!name || name.includes("\0") || name.includes("..")) continue;
-
-        // Reject individual files that exceed the size limit
-        if (value.size > MAX_UPLOAD_BYTES) {
-          skipped.push(name);
-          continue;
-        }
-
-        const destPath = resolve(targetDir, name);
-        if (!isSafePath(project.dir, destPath)) continue;
-
-        // Don't overwrite — append (2), (3), etc.
-        let finalPath = destPath;
-        let finalName = name;
-        if (existsSync(finalPath)) {
-          // Handle dotfiles correctly: .gitignore → ext="", base=".gitignore"
-          const dotIdx = name.indexOf(".", name.startsWith(".") ? 1 : 0);
-          const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
-          const base = dotIdx > 0 ? name.slice(0, dotIdx) : name;
-          let n = 2;
-          while (n < 10000 && existsSync(resolve(targetDir, `${base} (${n})${ext}`))) n++;
-          if (n >= 10000) {
-            skipped.push(name);
-            continue;
-          }
-          finalName = `${base} (${n})${ext}`;
-          finalPath = resolve(targetDir, finalName);
-        }
-
-        const buffer = Buffer.from(await value.arrayBuffer());
-        const validation = validateUploadedMediaBuffer(finalName, buffer);
-        if (!validation.ok) {
-          invalid.push({ name: finalName, reason: validation.reason });
-          continue;
-        }
-        writeFileSync(finalPath, buffer);
-        const relativePath = subDir ? join(subDir, finalName) : finalName;
-        uploaded.push(relativePath);
-        if (isAudioFile(finalName)) {
-          generateWaveformCache(project.dir, relativePath).catch(() => {});
-        }
-      }
-
-      return c.json({ ok: true, files: uploaded, skipped, invalid }, 201);
+      return c.json(
+        { ok: true, files: result.uploaded, skipped: result.skipped, invalid: result.invalid },
+        201,
+      );
     },
   );
 
@@ -564,94 +1168,11 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       });
     }
 
-    const { parseGsapScript } = await loadGsapParser();
-    const parsed = parseGsapScript(block.scriptText);
+    const parsed = parseGsapScriptAcorn(block.scriptText);
     return c.json(parsed);
   });
 
   // ── GSAP Mutations ──
-
-  type GsapMutationRequest =
-    | {
-        type: "update-property";
-        animationId: string;
-        property: string;
-        value: number | string;
-      }
-    | {
-        type: "update-from-property";
-        animationId: string;
-        property: string;
-        value: number | string;
-      }
-    | {
-        type: "update-meta";
-        animationId: string;
-        updates: { duration?: number; ease?: string; position?: number };
-      }
-    | {
-        type: "add";
-        targetSelector: string;
-        method: "to" | "from" | "set" | "fromTo";
-        position: number;
-        duration?: number;
-        ease?: string;
-        properties: Record<string, number | string>;
-        fromProperties?: Record<string, number | string>;
-      }
-    | { type: "delete"; animationId: string }
-    | {
-        type: "add-property";
-        animationId: string;
-        property: string;
-        defaultValue: number | string;
-      }
-    | {
-        type: "add-from-property";
-        animationId: string;
-        property: string;
-        defaultValue: number | string;
-      }
-    | { type: "remove-property"; animationId: string; property: string }
-    | { type: "remove-from-property"; animationId: string; property: string }
-    | {
-        type: "add-keyframe";
-        animationId: string;
-        percentage: number;
-        properties: Record<string, number | string>;
-        ease?: string;
-        backfillDefaults?: Record<string, number | string>;
-      }
-    | { type: "remove-keyframe"; animationId: string; percentage: number }
-    | {
-        type: "update-keyframe";
-        animationId: string;
-        percentage: number;
-        properties: Record<string, number | string>;
-        ease?: string;
-      }
-    | {
-        type: "convert-to-keyframes";
-        animationId: string;
-        resolvedFromValues?: Record<string, number | string>;
-      }
-    | { type: "remove-all-keyframes"; animationId: string }
-    | {
-        type: "materialize-keyframes";
-        animationId: string;
-        keyframes: Array<{
-          percentage: number;
-          properties: Record<string, number | string>;
-          ease?: string;
-        }>;
-        easeEach?: string;
-        resolvedSelector?: string;
-        allElements?: Array<{
-          selector: string;
-          keyframes: Array<{ percentage: number; properties: Record<string, number | string> }>;
-          easeEach?: string;
-        }>;
-      };
 
   api.post("/projects/:id/gsap-mutations/*", async (c) => {
     const res = await resolveProjectPath(c, adapter, (id) => `/projects/${id}/gsap-mutations/`, {
@@ -663,195 +1184,69 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
     if (!body || !body.type) {
       return c.json({ error: "mutation type required" }, 400);
     }
+    const unsafeFields = findUnsafeMutationValues(body);
+    if (unsafeFields.length > 0) {
+      return rejectUnsafeMutationValues(c, unsafeFields);
+    }
 
-    const html = readFileSync(res.absPath, "utf-8");
-    const block = extractGsapScriptBlock(html);
+    let html = readFileSync(res.absPath, "utf-8");
+    let block = extractGsapScriptBlock(html);
+    if (!block && (body.type === "add" || body.type === "add-with-keyframes")) {
+      const compId = html.match(/data-composition-id="([^"]+)"/)?.[1] ?? "main";
+      const { GSAP_CDN } = await import("../../templates/constants.js");
+      const gsapCdn = `<script src="${GSAP_CDN}"></script>`;
+      const bootstrap = [
+        gsapCdn,
+        "<script>",
+        "window.__timelines = window.__timelines || {};",
+        `const tl = gsap.timeline({ paused: true });`,
+        `window.__timelines["${compId}"] = tl;`,
+        "</script>",
+      ].join("\n");
+      if (html.includes("</body>")) {
+        html = html.replace("</body>", `${bootstrap}\n</body>`);
+      } else {
+        html += `\n${bootstrap}`;
+      }
+      block = extractGsapScriptBlock(html);
+    }
     if (!block) {
       return c.json({ error: "no GSAP script found in file" }, 400);
     }
 
-    const {
-      parseGsapScript,
-      updateAnimationInScript,
-      addAnimationToScript,
-      removeAnimationFromScript,
-    } = await loadGsapParser();
+    const respond = (data: unknown, status?: number) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- bridge between generic status and Hono's literal union
+      status ? c.json(data, status as any) : c.json(data);
 
-    function requireAnimation(
-      scriptText: string,
-      animationId: string,
-    ): { anim: GsapAnimation } | { err: Response } {
-      const parsed = parseGsapScript(scriptText);
-      const anim = parsed.animations.find((a) => a.id === animationId);
-      if (!anim) return { err: c.json({ error: "animation not found" }, 404) };
-      return { anim };
-    }
+    const result = await executeGsapMutation(body, block, respond);
+    if (result instanceof Response) return result;
 
-    function requireFromToAnimation(
-      scriptText: string,
-      animationId: string,
-    ): { anim: GsapAnimation } | { err: Response } {
-      const result = requireAnimation(scriptText, animationId);
-      if ("err" in result) return result;
-      if (result.anim.method !== "fromTo")
-        return { err: c.json({ error: "animation is not a fromTo" }, 400) };
-      return result;
-    }
-
-    let newScript: string;
-
-    // fallow-ignore-next-line complexity
-    switch (body.type) {
-      case "update-property": {
-        const r = requireAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          properties: { ...r.anim.properties, [body.property]: body.value },
-        });
-        break;
-      }
-      case "update-from-property": {
-        const r = requireFromToAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          fromProperties: { ...(r.anim.fromProperties ?? {}), [body.property]: body.value },
-        });
-        break;
-      }
-      case "update-meta": {
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, body.updates);
-        break;
-      }
-      case "add": {
-        if (body.fromProperties && body.method !== "fromTo") {
-          return c.json({ error: "fromProperties is only valid for method=fromTo" }, 400);
-        }
-        const result = addAnimationToScript(block.scriptText, {
-          targetSelector: body.targetSelector,
-          method: body.method,
-          position: body.position,
-          duration: body.duration,
-          ease: body.ease,
-          properties: body.properties,
-          fromProperties: body.fromProperties,
-        });
-        newScript = result.script;
-        break;
-      }
-      case "delete": {
-        newScript = removeAnimationFromScript(block.scriptText, body.animationId);
-        break;
-      }
-      case "add-property": {
-        const r = requireAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          properties: { ...r.anim.properties, [body.property]: body.defaultValue },
-        });
-        break;
-      }
-      case "add-from-property": {
-        const r = requireFromToAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          fromProperties: { ...(r.anim.fromProperties ?? {}), [body.property]: body.defaultValue },
-        });
-        break;
-      }
-      case "remove-property": {
-        const r = requireAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        const filtered = { ...r.anim.properties };
-        delete filtered[body.property];
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          properties: filtered,
-        });
-        break;
-      }
-      case "remove-from-property": {
-        const r = requireFromToAnimation(block.scriptText, body.animationId);
-        if ("err" in r) return r.err;
-        const filtered = { ...(r.anim.fromProperties ?? {}) };
-        delete filtered[body.property];
-        newScript = updateAnimationInScript(block.scriptText, body.animationId, {
-          fromProperties: filtered,
-        });
-        break;
-      }
-      case "add-keyframe": {
-        const { addKeyframeToScript } = await loadGsapParser();
-        newScript = addKeyframeToScript(
-          block.scriptText,
-          body.animationId,
-          body.percentage,
-          body.properties,
-          body.ease,
-          body.backfillDefaults,
-        );
-        break;
-      }
-      case "remove-keyframe": {
-        const { removeKeyframeFromScript } = await loadGsapParser();
-        newScript = removeKeyframeFromScript(block.scriptText, body.animationId, body.percentage);
-        break;
-      }
-      case "update-keyframe": {
-        const { updateKeyframeInScript } = await loadGsapParser();
-        newScript = updateKeyframeInScript(
-          block.scriptText,
-          body.animationId,
-          body.percentage,
-          body.properties,
-          body.ease,
-        );
-        break;
-      }
-      case "convert-to-keyframes": {
-        const { convertToKeyframesInScript } = await loadGsapParser();
-        newScript = convertToKeyframesInScript(
-          block.scriptText,
-          body.animationId,
-          body.resolvedFromValues,
-        );
-        break;
-      }
-      case "remove-all-keyframes": {
-        const { removeAllKeyframesFromScript } = await loadGsapParser();
-        newScript = removeAllKeyframesFromScript(block.scriptText, body.animationId);
-        break;
-      }
-      case "materialize-keyframes": {
-        const { materializeKeyframesInScript, unrollDynamicAnimations } = await loadGsapParser();
-        if (body.allElements && body.allElements.length > 0) {
-          newScript = unrollDynamicAnimations(block.scriptText, body.animationId, body.allElements);
-        } else {
-          newScript = materializeKeyframesInScript(
-            block.scriptText,
-            body.animationId,
-            body.keyframes,
-            body.easeEach,
-            body.resolvedSelector,
-          );
-        }
-        break;
-      }
-      default:
-        return c.json({ error: `unknown mutation type: ${(body as { type: string }).type}` }, 400);
-    }
-
-    const newHtml = block.replaceScript(newScript);
-    if (newHtml !== html) {
+    const newScript = typeof result === "string" ? result : result.script;
+    const changed = newScript !== block.scriptText;
+    const newHtml = changed ? block.replaceScript(newScript) : html;
+    let backupPath: string | null = null;
+    if (changed) {
+      const backup = snapshotBeforeWrite(res.project.dir, res.absPath);
+      if (backup.error)
+        console.warn(`Failed to create backup for ${res.filePath}: ${backup.error}`);
+      backupPath = backupPathForResponse(res.project.dir, backup.backupPath);
       writeFileSync(res.absPath, newHtml, "utf-8");
     }
 
-    // Re-parse the mutated script so the UI gets fresh state
-    const freshParsed = parseGsapScript(newScript);
-    return c.json({
+    const freshParsed = parseGsapScriptAcorn(newScript);
+    const responsePayload: Record<string, unknown> = {
       ok: true,
+      changed,
       parsed: freshParsed,
       before: html,
       after: newHtml,
       scriptText: newScript,
-    });
+      path: res.filePath,
+      backupPath,
+    };
+    if (typeof result !== "string" && result.skippedSelectors.length > 0) {
+      responsePayload.skippedSelectors = result.skippedSelectors;
+    }
+    return c.json(responsePayload);
   });
 }

@@ -7,6 +7,7 @@
  * parsing of GSAP source lives in the Node-only `./gsapParser` module.
  */
 import type { Keyframe, KeyframeProperties, ValidationResult } from "../core.types";
+import type { PropertyGroupName } from "./gsapConstants";
 
 export type GsapMethod = "set" | "to" | "from" | "fromTo";
 
@@ -23,10 +24,19 @@ export interface GsapAnimation {
   extras?: Record<string, unknown>;
   /** Native GSAP keyframes data — present when the tween uses keyframes: { ... }. */
   keyframes?: GsapKeyframesData;
+  /** Arc motion path config — present when the tween uses motionPath for curved position interpolation. */
+  arcPath?: ArcPathConfig;
   /** True when the tween has a `keyframes` property that couldn't be statically resolved (dynamic). */
   hasUnresolvedKeyframes?: boolean;
   /** True when the tween's target selector couldn't be statically resolved (dynamic). */
   hasUnresolvedSelector?: boolean;
+  /** Absolute start time computed by walking the timeline chain (handles +=, -=, <, >, labels). */
+  resolvedStart?: number;
+  /** True when no position arg was authored — the tween is sequentially placed by GSAP. */
+  implicitPosition?: boolean;
+  /** Which property group this tween belongs to (position, scale, size, rotation, visual, other).
+   *  Undefined for legacy mixed tweens that bundle multiple groups. */
+  propertyGroup?: PropertyGroupName;
 }
 
 export interface GsapPercentageKeyframe {
@@ -42,6 +52,18 @@ export interface GsapKeyframesData {
   keyframes: GsapPercentageKeyframe[];
   ease?: string;
   easeEach?: string;
+}
+
+export interface ArcPathSegment {
+  curviness: number;
+  cp1?: { x: number; y: number };
+  cp2?: { x: number; y: number };
+}
+
+export interface ArcPathConfig {
+  enabled: boolean;
+  autoRotate: boolean | number;
+  segments: ArcPathSegment[];
 }
 
 export interface ParsedGsap {
@@ -63,10 +85,13 @@ export function serializeGsapAnimations(
   options?: { includeMediaSync?: boolean; preamble?: string; postamble?: string },
 ): string {
   const sorted = [...animations].sort((a, b) => {
-    const aNum = typeof a.position === "number" ? a.position : Number.MAX_SAFE_INTEGER;
-    const bNum = typeof b.position === "number" ? b.position : Number.MAX_SAFE_INTEGER;
+    const aNum =
+      a.resolvedStart ?? (typeof a.position === "number" ? a.position : Number.MAX_SAFE_INTEGER);
+    const bNum =
+      b.resolvedStart ?? (typeof b.position === "number" ? b.position : Number.MAX_SAFE_INTEGER);
     return aNum - bNum;
   });
+  // fallow-ignore-next-line complexity
   const lines = sorted.map((anim) => {
     const selector = `"${anim.targetSelector}"`;
     const props: Record<string, number | string> = { ...anim.properties };
@@ -129,7 +154,7 @@ ${lines.join("\n")}${mediaSync}${postamble}
   `;
 }
 
-function serializeValue(value: unknown): string {
+export function serializeValue(value: unknown): string {
   if (typeof value === "string" && value.startsWith("__raw:")) {
     return value.slice(6);
   }
@@ -137,10 +162,13 @@ function serializeValue(value: unknown): string {
   return String(value);
 }
 
+export function safeJsKey(key: string): string {
+  return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
+}
+
 function serializeObject(obj: Record<string, number | string>): string {
   const entries = Object.entries(obj).map(([key, value]) => {
-    const safeKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
-    return `${safeKey}: ${serializeValue(value)}`;
+    return `${safeJsKey(key)}: ${serializeValue(value)}`;
   });
   return `{ ${entries.join(", ")} }`;
 }
@@ -148,8 +176,7 @@ function serializeObject(obj: Record<string, number | string>): string {
 function serializeExtras(extras: Record<string, unknown>): string {
   return Object.entries(extras)
     .map(([key, value]) => {
-      const safeKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
-      return `${safeKey}: ${serializeValue(value)}`;
+      return `${safeJsKey(key)}: ${serializeValue(value)}`;
     })
     .join(", ");
 }
@@ -174,12 +201,9 @@ export function getAnimationsForElementId(
 const FORBIDDEN_GSAP_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
   { pattern: /\.call\s*\(/, message: "call() method not allowed" },
   { pattern: /\.add\s*\(/, message: "add() method not allowed" },
-  { pattern: /\.addLabel\s*\(/, message: "addLabel() method not allowed" },
   { pattern: /\.addPause\s*\(/, message: "addPause() method not allowed" },
-  { pattern: /gsap\.registerPlugin\s*\(/, message: "registerPlugin() not allowed" },
   { pattern: /gsap\.registerEffect\s*\(/, message: "registerEffect() not allowed" },
   { pattern: /ScrollTrigger/, message: "ScrollTrigger not allowed" },
-  { pattern: /MotionPathPlugin/, message: "MotionPathPlugin not allowed" },
   { pattern: /onComplete\s*:/, message: "onComplete callback not allowed" },
   { pattern: /onUpdate\s*:/, message: "onUpdate callback not allowed" },
   { pattern: /onStart\s*:/, message: "onStart callback not allowed" },
@@ -223,6 +247,7 @@ export function keyframesToGsapAnimations(
   const baseY = base?.y ?? 0;
   const baseScale = base?.scale ?? 1;
 
+  // fallow-ignore-next-line complexity
   sorted.forEach((kf, i) => {
     const absoluteTime = elementStartTime + kf.time;
     const isFirst = i === 0;
@@ -274,9 +299,12 @@ export function gsapAnimationsToKeyframes(
   const baseValueEpsilon = 0.00001;
 
   return animations
-    .filter((a) => validMethods.includes(a.method) && typeof a.position === "number")
+    .filter(
+      (a): a is GsapAnimation & { position: number } =>
+        validMethods.includes(a.method) && typeof a.position === "number",
+    )
     .map((a) => {
-      const relativeTimeRaw = (a.position as number) - elementStartTime;
+      const relativeTimeRaw = a.position - elementStartTime;
       const time = clampTimeToZero ? Math.max(0, relativeTimeRaw) : relativeTimeRaw;
 
       const properties: Partial<KeyframeProperties> = {};
@@ -309,5 +337,5 @@ export function gsapAnimationsToKeyframes(
         ease: a.ease,
       };
     })
-    .filter((kf): kf is NonNullable<typeof kf> => kf !== null) as Keyframe[];
+    .filter((kf): kf is NonNullable<typeof kf> => kf !== null);
 }

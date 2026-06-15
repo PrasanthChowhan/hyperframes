@@ -22,12 +22,14 @@ export {
   shouldIgnorePlaybackShortcutTarget,
 } from "../lib/playbackShortcuts";
 
-import type { PlaybackAdapter, RuntimePlaybackAdapter, IframeWindow } from "../lib/playbackTypes";
+import type { PlaybackAdapter, IframeWindow } from "../lib/playbackTypes";
 import {
   getAdapterDuration,
   wrapTimeline,
-  createStaticSeekPlaybackAdapter,
   getDefaultStaticSeekPlaybackClock,
+  releaseStaticSeekCache,
+  resolveStaticSeekFallback,
+  type StaticSeekCacheEntry,
 } from "../lib/playbackAdapter";
 import {
   readTimelineDurationFromDocument,
@@ -39,8 +41,29 @@ import {
   setPreviewPlaybackRate,
   shouldMutePreviewAudio,
 } from "../lib/timelineIframeHelpers";
-import { probeMediaUrl, getCachedProbe } from "../lib/mediaProbe";
+import { scrubMusicAtSeek, stopScrubPreviewAudio } from "../lib/playbackScrub";
+import { applyCachedSourceDurations, probeMissingSourceDurations } from "../lib/mediaProbe";
 import { shouldResumeForwardPlaybackAfterSeek, shouldStopAfterSeek } from "../lib/playbackSeek";
+
+/**
+ * Whether the derived elements differ from the current ones in any field that
+ * affects rendering (identity, timing, track, or source length) — used to skip
+ * redundant store writes.
+ */
+function timelineElementsChanged(prev: TimelineElement[], next: TimelineElement[]): boolean {
+  if (next.length !== prev.length) return true;
+  return next.some((el, i) => {
+    const p = prev[i];
+    return (
+      !p ||
+      el.id !== p.id ||
+      el.start !== p.start ||
+      el.duration !== p.duration ||
+      el.track !== p.track ||
+      el.sourceDuration !== p.sourceDuration
+    );
+  });
+}
 
 export function useTimelinePlayer() {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -53,11 +76,8 @@ export function useTimelinePlayer() {
   const shuttleSpeedIndexRef = useRef(0);
   const iframeShortcutCleanupRef = useRef<(() => void) | null>(null);
   const lastTimelineMessageRef = useRef<number>(0);
-  const staticSeekAdapterRef = useRef<{
-    player: RuntimePlaybackAdapter | PlaybackAdapter;
-    duration: number;
-    adapter: PlaybackAdapter;
-  } | null>(null);
+  const staticSeekAdapterRef = useRef<StaticSeekCacheEntry | null>(null);
+  const staticSeekWarnedRef = useRef(false);
 
   const { setIsPlaying, setCurrentTime, setDuration, setTimelineReady, setElements } =
     usePlayerStore.getState();
@@ -66,27 +86,19 @@ export function useTimelinePlayer() {
     (elements: TimelineElement[], nextDuration?: number) => {
       const state = usePlayerStore.getState();
       const resolvedDuration = nextDuration ?? state.duration;
-      const mergedElements = mergeTimelineElementsPreservingDowngrades(
-        state.elements,
-        elements,
-        state.duration,
-        resolvedDuration,
+      // applyCachedSourceDurations re-applies the cached probe duration: re-derived
+      // elements (e.g. after a clip move) can arrive without sourceDuration, which
+      // otherwise makes trimmed waveforms lose their window.
+      const mergedElements = applyCachedSourceDurations(
+        mergeTimelineElementsPreservingDowngrades(
+          state.elements,
+          elements,
+          state.duration,
+          resolvedDuration,
+        ),
       );
 
-      const elementsChanged =
-        mergedElements.length !== state.elements.length ||
-        mergedElements.some((el, i) => {
-          const prev = state.elements[i];
-          return (
-            !prev ||
-            el.id !== prev.id ||
-            el.start !== prev.start ||
-            el.duration !== prev.duration ||
-            el.track !== prev.track
-          );
-        });
-
-      if (elementsChanged) {
+      if (timelineElementsChanged(state.elements, mergedElements)) {
         setElements(mergedElements);
       }
       if (
@@ -100,31 +112,17 @@ export function useTimelinePlayer() {
         setTimelineReady(true);
       }
 
-      // Asynchronously enrich media elements missing sourceDuration via mediabunny.
-      // The probe reads file headers only — no full decode — so this is cheap.
-      const needsProbe = mergedElements.filter(
-        (el) =>
-          el.src &&
-          el.sourceDuration == null &&
-          ["video", "audio"].includes(el.tag.toLowerCase()) &&
-          getCachedProbe(el.src) === undefined,
-      );
-      if (needsProbe.length > 0) {
-        void Promise.allSettled(
-          needsProbe.map(async (el) => {
-            const result = await probeMediaUrl(el.src!);
-            if (!result) return;
-            const key = el.key ?? el.id;
-            usePlayerStore.setState((state) => {
-              const idx = state.elements.findIndex((e) => (e.key ?? e.id) === key);
-              if (idx === -1 || state.elements[idx].sourceDuration != null) return {};
-              const patched = state.elements.slice();
-              patched[idx] = { ...state.elements[idx], sourceDuration: result.duration };
-              return { elements: patched };
-            });
-          }),
-        );
-      }
+      // Asynchronously enrich media elements still missing sourceDuration
+      // (header-only probe, cheap), applying each resolved value to the store.
+      void probeMissingSourceDurations(mergedElements, (key, durationSeconds) => {
+        usePlayerStore.setState((state) => {
+          const idx = state.elements.findIndex((e) => (e.key ?? e.id) === key);
+          if (idx === -1 || state.elements[idx].sourceDuration != null) return {};
+          const patched = state.elements.slice();
+          patched[idx] = { ...state.elements[idx], sourceDuration: durationSeconds };
+          return { elements: patched };
+        });
+      });
     },
     [setElements, setTimelineReady, setDuration],
   );
@@ -141,6 +139,7 @@ export function useTimelinePlayer() {
       const adapterDur = getAdapterDuration(playerAdapter);
 
       if (adapterDur > 0 && docDuration <= adapterDur) {
+        releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
         return playerAdapter;
       }
 
@@ -148,24 +147,28 @@ export function useTimelinePlayer() {
       if (win.__timeline) {
         const adapter = wrapTimeline(win.__timeline);
         const dur = getAdapterDuration(adapter);
-        if (dur > 0 && docDuration <= dur) return adapter;
+        if (dur > 0 && docDuration <= dur) {
+          releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
+          return adapter;
+        }
         if (dur > 0) timelineAdapter ??= adapter;
       }
 
       if (win.__timelines) {
         const keys = Object.keys(win.__timelines);
         if (keys.length > 0) {
-          // Resolve the root composition id from the DOM — the outermost
-          // `[data-composition-id]` element is the master. Without this,
-          // Object.keys() order would let a sub-composition's timeline
-          // hijack play/pause/seek and the duration readout.
+          // Resolve the root composition id from the DOM — the outermost [data-composition-id]
+          // is the master; otherwise Object.keys() order lets a sub-composition hijack transport.
           const rootId = iframe?.contentDocument
             ?.querySelector("[data-composition-id]")
             ?.getAttribute("data-composition-id");
           const key = rootId && rootId in win.__timelines ? rootId : keys[keys.length - 1];
           const adapter = wrapTimeline(win.__timelines[key]);
           const dur = getAdapterDuration(adapter);
-          if (dur > 0 && docDuration <= dur) return adapter;
+          if (dur > 0 && docDuration <= dur) {
+            releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
+            return adapter;
+          }
           if (dur > 0) timelineAdapter ??= adapter;
         }
       }
@@ -184,23 +187,15 @@ export function useTimelinePlayer() {
         effectiveDuration > 0 &&
         ("renderSeek" in bestAdapter || typeof bestAdapter.seek === "function")
       ) {
-        const cached = staticSeekAdapterRef.current;
-        if (cached?.player === bestAdapter && cached.duration === effectiveDuration) {
-          return cached.adapter;
-        }
-        cached?.adapter.pause();
-        const adapter = createStaticSeekPlaybackAdapter(
+        return resolveStaticSeekFallback({
+          cache: staticSeekAdapterRef,
+          warned: staticSeekWarnedRef,
           bestAdapter,
           effectiveDuration,
-          getDefaultStaticSeekPlaybackClock(win),
-          () => usePlayerStore.getState().playbackRate,
-        );
-        staticSeekAdapterRef.current = {
-          player: bestAdapter,
-          duration: effectiveDuration,
-          adapter,
-        };
-        return adapter;
+          docDuration,
+          clock: getDefaultStaticSeekPlaybackClock(win),
+          getPlaybackRate: () => usePlayerStore.getState().playbackRate,
+        });
       }
 
       return bestAdapter;
@@ -284,6 +279,7 @@ export function useTimelinePlayer() {
   const play = useCallback(() => {
     stopRAFLoop();
     stopReverseLoop();
+    stopScrubPreviewAudio();
     const adapter = getAdapter();
     if (!adapter) return;
     if (adapter.getTime() >= adapter.getDuration()) {
@@ -396,6 +392,7 @@ export function useTimelinePlayer() {
       adapter.seek(nextTime, options);
       liveTime.notify(nextTime); // Direct DOM updates (playhead, timecode, progress) — no re-render
       setCurrentTime(nextTime); // sync store so Split/Delete have accurate time
+      if (!shouldResumeAfterSeek && !keepPlaying) scrubMusicAtSeek(iframeRef.current, nextTime);
       if (shouldResumeAfterSeek) {
         stopRAFLoop();
         applyPlaybackRate(usePlayerStore.getState().playbackRate);
@@ -561,6 +558,8 @@ export function useTimelinePlayer() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       stopRAFLoop();
       stopReverseLoop();
+      stopScrubPreviewAudio();
+      releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
       if (probeIntervalRef.current) clearInterval(probeIntervalRef.current);
     };
   });

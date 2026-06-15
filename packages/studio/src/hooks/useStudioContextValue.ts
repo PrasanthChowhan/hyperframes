@@ -1,11 +1,6 @@
 import { useCallback, useMemo, useRef, useState, type DragEvent } from "react";
-import {
-  STUDIO_INSPECTOR_PANELS_ENABLED,
-  STUDIO_MOTION_PANEL_ENABLED,
-} from "../components/editor/manualEditingAvailability";
-import { readStudioMotionFromElement } from "../components/editor/studioMotion";
+import { STUDIO_INSPECTOR_PANELS_ENABLED } from "../components/editor/manualEditingAvailability";
 import type { StudioContextValue } from "../contexts/StudioContext";
-import type { DomEditSelection } from "../components/editor/domEditing";
 
 interface StudioContextInput {
   projectId: string;
@@ -17,7 +12,6 @@ interface StudioContextInput {
   compositionLoading: boolean;
   refreshKey: number;
   setRefreshKey: React.Dispatch<React.SetStateAction<number>>;
-  currentTime: number;
   timelineElements: StudioContextValue["timelineElements"];
   isPlaying: boolean;
   editHistory: { canUndo: boolean; canRedo: boolean; undoLabel: string; redoLabel: string };
@@ -50,7 +44,7 @@ export function buildStudioContextValue(input: StudioContextInput): StudioContex
     compositionLoading: input.compositionLoading,
     refreshKey: input.refreshKey,
     setRefreshKey: input.setRefreshKey,
-    currentTime: input.currentTime,
+
     timelineElements: input.timelineElements,
     isPlaying: input.isPlaying,
     editHistory: input.editHistory,
@@ -67,10 +61,8 @@ export function buildStudioContextValue(input: StudioContextInput): StudioContex
 }
 
 export interface InspectorState {
-  selectedStudioMotion: ReturnType<typeof readStudioMotionFromElement> | null;
   layersPanelActive: boolean;
   designPanelActive: boolean;
-  motionPanelActive: boolean;
   inspectorPanelActive: boolean;
   inspectorButtonActive: boolean;
   shouldShowSelectedDomBounds: boolean;
@@ -80,30 +72,23 @@ export function useInspectorState(
   rightPanelTab: string,
   rightCollapsed: boolean,
   isPlaying: boolean,
-  domEditSelection: DomEditSelection | null,
+  isGestureRecording?: boolean,
 ): InspectorState {
   // fallow-ignore-next-line complexity
   return useMemo(() => {
-    const selectedStudioMotion =
-      STUDIO_INSPECTOR_PANELS_ENABLED && domEditSelection
-        ? readStudioMotionFromElement(domEditSelection.element)
-        : null;
     const layersPanelActive = STUDIO_INSPECTOR_PANELS_ENABLED && rightPanelTab === "layers";
     const designPanelActive = STUDIO_INSPECTOR_PANELS_ENABLED && rightPanelTab === "design";
-    const motionPanelActive =
-      STUDIO_INSPECTOR_PANELS_ENABLED && STUDIO_MOTION_PANEL_ENABLED && rightPanelTab === "motion";
-    const inspectorPanelActive = layersPanelActive || designPanelActive || motionPanelActive;
+    const inspectorPanelActive = layersPanelActive || designPanelActive;
     return {
-      selectedStudioMotion,
       layersPanelActive,
       designPanelActive,
-      motionPanelActive,
       inspectorPanelActive,
       inspectorButtonActive:
         STUDIO_INSPECTOR_PANELS_ENABLED && !rightCollapsed && inspectorPanelActive,
-      shouldShowSelectedDomBounds: inspectorPanelActive && !rightCollapsed && !isPlaying,
+      shouldShowSelectedDomBounds:
+        inspectorPanelActive && !rightCollapsed && !isPlaying && !isGestureRecording,
     };
-  }, [rightPanelTab, rightCollapsed, isPlaying, domEditSelection]);
+  }, [rightPanelTab, rightCollapsed, isPlaying, isGestureRecording]);
 }
 
 // fallow-ignore-next-line complexity

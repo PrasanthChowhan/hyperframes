@@ -4,7 +4,13 @@ type IframeWindow = Window & {
   __hfForceTimelineRebind?: () => void;
   __hfSuppressSceneMutations?: <T>(fn: () => T) => T;
   __hfStudioManualEditsApply?: () => void;
-  gsap?: { timeline?: (...args: unknown[]) => unknown };
+  gsap?: {
+    timeline?: (...args: unknown[]) => unknown;
+    registerPlugin?: (...plugins: unknown[]) => unknown;
+    set?: (targets: Element | Element[], vars: Record<string, unknown>) => void;
+    globalTimeline?: { getChildren?: (deep: boolean) => Array<{ kill?: () => void }> };
+  };
+  MotionPathPlugin?: unknown;
 };
 
 function isGsapScript(text: string): boolean {
@@ -23,6 +29,14 @@ function findGsapScriptElements(doc: Document): HTMLScriptElement[] {
     if (isGsapScript(script.textContent || "")) results.push(script);
   }
   return results;
+}
+
+/** Check that the new script repopulated __timelines with at least one entry. */
+function verifyTimelinesPopulated(win: IframeWindow): boolean {
+  const tlKeys = win.__timelines
+    ? Object.keys(win.__timelines).filter((k) => k !== "__proxied")
+    : [];
+  return tlKeys.length > 0;
 }
 
 /**
@@ -52,28 +66,83 @@ export function applySoftReload(iframe: HTMLIFrameElement | null, scriptText: st
 
   const currentTime = win.__player?.getTime?.() ?? 0;
 
+  // Track whether the MotionPath async path was taken. When it is, the script
+  // executes inside pluginScript.onload — after applySoftReload has already
+  // returned. We optimistically return true because the script WILL execute
+  // once the plugin loads; the alternative (returning false) would trigger a
+  // full iframe reload that destroys the very WebGL context we're preserving.
+  let deferredToAsync = false;
+
   const doReload = () => {
     const timelines = win.__timelines;
+    const allTargets: Element[] = [];
+
     if (timelines) {
       for (const key of Object.keys(timelines)) {
+        if (key === "__proxied") continue;
         try {
-          timelines[key]?.kill?.();
+          const tl = timelines[key] as {
+            kill?: () => void;
+            getChildren?: (deep: boolean) => Array<{ targets?: () => Element[] }>;
+          };
+          if (tl?.getChildren) {
+            try {
+              for (const child of tl.getChildren(true)) {
+                if (typeof child.targets === "function") {
+                  for (const t of child.targets()) allTargets.push(t);
+                }
+              }
+            } catch {}
+          }
+          tl?.kill?.();
         } catch {}
         delete timelines[key];
       }
     }
 
-    oldScriptEl.remove();
-    const newScript = doc.createElement("script");
-    // IIFE prevents const/let redeclaration errors across consecutive edits.
-    // Top-level declarations are scoped to the IIFE; window.* assignments
-    // (e.g. window.__timelines["root"] = tl) still reach the global scope.
-    newScript.textContent = `(function(){${scriptText}\n})();`;
-    doc.body.appendChild(newScript);
+    // Kill bare gsap.to/from tweens not registered on __timelines
+    if (win.gsap?.globalTimeline?.getChildren) {
+      try {
+        for (const child of win.gsap.globalTimeline.getChildren(false)) {
+          child.kill?.();
+        }
+      } catch {}
+    }
 
-    win.__hfForceTimelineRebind?.();
-    win.__player?.seek?.(currentTime);
-    win.__hfStudioManualEditsApply?.();
+    // Clear residual inline transforms left by killed tweens so from() tweens
+    // don't read stale end values from the DOM on re-execution
+    if (allTargets.length > 0 && win.gsap?.set) {
+      try {
+        win.gsap.set(allTargets, { clearProps: "all" });
+      } catch {}
+    }
+
+    oldScriptEl.remove();
+
+    const executeScript = () => {
+      if (win.MotionPathPlugin && win.gsap?.registerPlugin) {
+        win.gsap.registerPlugin(win.MotionPathPlugin);
+      }
+      const s = doc.createElement("script");
+      s.textContent = `(function(){${scriptText}\n})();`;
+      doc.body.appendChild(s);
+      win.__hfForceTimelineRebind?.();
+      win.__player?.seek?.(currentTime);
+      win.__hfStudioManualEditsApply?.();
+    };
+
+    const needsMotionPath = /motionPath\s*[:{]/.test(scriptText);
+    if (needsMotionPath && !win.MotionPathPlugin && win.gsap) {
+      deferredToAsync = true;
+      const pluginScript = doc.createElement("script");
+      pluginScript.src = "https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/MotionPathPlugin.min.js";
+      pluginScript.onload = () => executeScript();
+      pluginScript.onerror = () => executeScript();
+      doc.head.appendChild(pluginScript);
+      return;
+    }
+
+    executeScript();
   };
 
   try {
@@ -82,7 +151,10 @@ export function applySoftReload(iframe: HTMLIFrameElement | null, scriptText: st
     } else {
       doReload();
     }
-    return true;
+    // When MotionPath needs async loading, the script hasn't executed yet —
+    // skip the __timelines check and return true optimistically.
+    if (deferredToAsync) return true;
+    return verifyTimelinesPopulated(win);
   } catch {
     return false;
   }

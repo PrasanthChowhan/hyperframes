@@ -1,7 +1,10 @@
+// fallow-ignore-file complexity
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { findFFmpeg, findFFprobe, getFFmpegInstallHint } from "../browser/ffmpeg.js";
 import { ensureWhisper, ensureModel, hasFFmpeg, DEFAULT_MODEL } from "./manager.js";
 
 /**
@@ -40,6 +43,7 @@ function findWavDataChunk(buf: Buffer): { offset: number; size: number } | null 
  * sustained energy jump above the track's median RMS. Returns onset time in
  * seconds, or null if the track has consistent energy throughout.
  */
+// fallow-ignore-next-line complexity
 export function detectSpeechOnset(wavPath: string): number | null {
   const SAMPLE_RATE = 16000;
   const WINDOW_SECONDS = 0.5;
@@ -121,12 +125,32 @@ function isVideoFile(filePath: string): boolean {
 }
 
 /**
+ * Unique path for the temporary 16kHz mono WAV fed to whisper.
+ *
+ * MUST be unique per call AND per process: callers run many `transcribe`
+ * invocations in parallel (e.g. the product-launch-video audio pipeline spawns
+ * one `hyperframes transcribe` per scene at once). A `Date.now()`-based name
+ * collides when two conversions land in the same millisecond — they clobber
+ * each other's WAV in the shared tmpdir, so whisper transcribes the wrong
+ * scene's audio and every colliding scene gets identical word timings.
+ */
+function tempWavPath(): string {
+  return join(tmpdir(), `hyperframes-audio-${process.pid}-${randomUUID()}.wav`);
+}
+
+/**
  * Extract audio from a video file as 16kHz mono WAV (whisper requirement).
  */
 function extractAudio(videoPath: string): string {
-  const wavPath = join(tmpdir(), `hyperframes-audio-${Date.now()}.wav`);
+  const ffmpegPath = findFFmpeg();
+  if (!ffmpegPath) {
+    throw new Error(
+      `ffmpeg is required to extract audio from video. Install: ${getFFmpegInstallHint()}`,
+    );
+  }
+  const wavPath = tempWavPath();
   execFileSync(
-    "ffmpeg",
+    ffmpegPath,
     ["-i", videoPath, "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", "-y", wavPath],
     { stdio: "ignore", timeout: 120_000 },
   );
@@ -138,8 +162,10 @@ function extractAudio(videoPath: string): string {
  */
 function isWav16kMono(filePath: string): boolean {
   try {
+    const ffprobePath = findFFprobe();
+    if (!ffprobePath) return false;
     const raw = execFileSync(
-      "ffprobe",
+      ffprobePath,
       ["-v", "quiet", "-print_format", "json", "-show_streams", filePath],
       { encoding: "utf-8", timeout: 10_000 },
     );
@@ -166,9 +192,13 @@ function prepareAudio(audioPath: string): string {
   }
 
   // Convert to whisper-compatible WAV
-  const wavPath = join(tmpdir(), `hyperframes-audio-${Date.now()}.wav`);
+  const ffmpegPath = findFFmpeg();
+  if (!ffmpegPath) {
+    throw new Error(`ffmpeg is required to prepare audio. Install: ${getFFmpegInstallHint()}`);
+  }
+  const wavPath = tempWavPath();
   execFileSync(
-    "ffmpeg",
+    ffmpegPath,
     ["-i", audioPath, "-ar", "16000", "-ac", "1", "-f", "wav", "-y", wavPath],
     { stdio: "ignore", timeout: 120_000 },
   );
@@ -178,6 +208,7 @@ function prepareAudio(audioPath: string): string {
 /**
  * Transcribe an audio or video file and save transcript.json to the output directory.
  */
+// fallow-ignore-next-line complexity
 export async function transcribe(
   inputPath: string,
   outputDir: string,
@@ -205,7 +236,7 @@ export async function transcribe(
   } else if (isVideoFile(inputPath)) {
     if (!hasFFmpeg()) {
       throw new Error(
-        "ffmpeg is required to extract audio from video. Install: brew install ffmpeg",
+        `ffmpeg is required to extract audio from video. Install: ${getFFmpegInstallHint()}`,
       );
     }
     options?.onProgress?.("Extracting audio from video...");

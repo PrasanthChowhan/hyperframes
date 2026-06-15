@@ -53,11 +53,6 @@ export {
   isMediaElement,
   isCompositionElement,
   getDefaultStageZoom,
-  isStringVariable,
-  isNumberVariable,
-  isColorVariable,
-  isBooleanVariable,
-  isEnumVariable,
 } from "./core.types";
 
 // Templates
@@ -136,6 +131,7 @@ export {
 } from "./compiler/rewriteSubCompPaths";
 export { CSS_URL_RE, isNonRelativeUrl, isPathInside } from "./compiler/assetPaths";
 export { decodeUrlPathVariants } from "./utils/urlPath";
+export { parseAnimatedGifMetadata, type AnimatedGifMetadata } from "./media/gif";
 
 // Inline scripts
 export {
@@ -162,6 +158,7 @@ export {
   type MediaVisualStyleProperty,
 } from "./inline-scripts/parityContract";
 export { redactTelemetryString } from "./telemetryRedaction";
+export { isSafePath, resolveWithinProject } from "./safePath";
 export type {
   HyperframePickerApi,
   HyperframePickerBoundingBox,

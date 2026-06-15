@@ -1,9 +1,9 @@
 import type { Hono } from "hono";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { injectScriptsIntoHtml } from "../../compiler/htmlDocument.js";
 import type { StudioApiAdapter } from "../types.js";
-import { isSafePath } from "../helpers/safePath.js";
+import { resolveWithinProject } from "../helpers/safePath.js";
 import { getMimeType } from "../helpers/mime.js";
 import { buildSubCompositionHtml } from "../helpers/subComposition.js";
 import { createProjectSignature } from "../helpers/projectSignature.js";
@@ -67,12 +67,14 @@ function injectScriptTagIntoHead(html: string, scriptTag: string): string {
 }
 
 function htmlHasGsap(html: string): boolean {
-  // Keep this heuristic conservative: if user source already loads GSAP, Studio does not add another copy.
+  // Only match GSAP references outside <template> elements — scripts inside
+  // templates are inert when cloned and don't make GSAP globally available.
+  const outsideTemplates = html.replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, "");
   return (
-    /<script\b[^>]*src=["'][^"']*gsap/i.test(html) ||
-    /\/\*\s*inlined:.*gsap/i.test(html) ||
-    /\b(GreenSock|_gsScope)\b/.test(html) ||
-    /\bgsap\.(config|defaults|registerPlugin|version)\b/.test(html)
+    /<script\b[^>]*src=["'][^"']*gsap/i.test(outsideTemplates) ||
+    /\/\*\s*inlined:.*gsap/i.test(outsideTemplates) ||
+    /\b(GreenSock|_gsScope)\b/.test(outsideTemplates) ||
+    /\bgsap\.(config|defaults|registerPlugin|version)\b/.test(outsideTemplates)
   );
 }
 
@@ -285,12 +287,8 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
     const compPath = decodeURIComponent(
       c.req.path.replace(`/projects/${project.id}/preview/comp/`, "").split("?")[0] ?? "",
     );
-    const compFile = resolve(project.dir, compPath);
-    if (
-      !isSafePath(project.dir, compFile) ||
-      !existsSync(compFile) ||
-      !statSync(compFile).isFile()
-    ) {
+    const compFile = resolveWithinProject(project.dir, compPath);
+    if (!compFile || !existsSync(compFile) || !statSync(compFile).isFile()) {
       return c.text("not found", 404);
     }
 
@@ -319,9 +317,12 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
     const subPath = decodeURIComponent(
       c.req.path.replace(`/projects/${project.id}/preview/`, "").split("?")[0] ?? "",
     );
-    const file = resolve(project.dir, subPath);
+    const file = resolveWithinProject(project.dir, subPath);
+    if (!file) {
+      return c.text("not found", 404);
+    }
     const stat = existsSync(file) ? statSync(file) : null;
-    if (!isSafePath(project.dir, file) || !stat?.isFile()) {
+    if (!stat?.isFile()) {
       return c.text("not found", 404);
     }
     const contentType = getMimeType(subPath);
