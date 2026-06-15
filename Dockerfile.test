@@ -66,7 +66,7 @@ RUN npx --yes @puppeteer/browsers install chrome-headless-shell@148.0.7778.167 \
 WORKDIR /app
 
 # Install bun
-RUN curl -fsSL https://bun.sh/install | bash
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL="/root/.bun" bash -s "bun-v1.3.13"
 ENV PATH="/root/.bun/bin:$PATH"
 
 # Install dependencies (full, including devDependencies for tsx + test harness)
