@@ -27,7 +27,7 @@ import { useCompositionDimensions } from "./hooks/useCompositionDimensions";
 import { useToast } from "./hooks/useToast";
 import { useStudioUrlState } from "./hooks/useStudioUrlState";
 import { GlobalCatalogActionsManager } from "./components/GlobalCatalogActionsManager";
-import { RightPanelPortal } from "./components/RightPanelPortal";
+
 import {
   buildStudioContextValue,
   useDragOverlay,
@@ -541,7 +541,6 @@ export function StudioApp() {
                     }
                   />
                   {!panelLayout.rightCollapsed && (
-                    <RightPanelPortal>
                       <StudioRightPanel
                         designPanelActive={designPanelActive}
                         activeBlockParams={activeBlockParams}
@@ -555,7 +554,6 @@ export function StudioApp() {
                           STUDIO_KEYFRAMES_ENABLED ? handleToggleRecording : undefined
                         }
                       />
-                    </RightPanelPortal>
                   )}
                 </div>
                 {lintModal !== null && (
