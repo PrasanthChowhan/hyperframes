@@ -14,6 +14,7 @@ export interface DomEditActionsValue extends Pick<
   | "clearDomSelection"
   | "handleDomStyleCommit"
   | "handleDomAttributeCommit"
+  | "handleDomAttributeLiveCommit"
   | "handleDomHtmlAttributeCommit"
   | "handleDomPathOffsetCommit"
   | "handleDomGroupPathOffsetCommit"
@@ -56,6 +57,7 @@ export interface DomEditActionsValue extends Pick<
   | "commitAnimatedProperty"
   | "handleSetArcPath"
   | "handleUpdateArcSegment"
+  | "handleUnroll"
   | "invalidateGsapCache"
   | "previewIframeRef"
   | "commitMutation"
@@ -114,6 +116,7 @@ export function DomEditProvider({
     clearDomSelection,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomPathOffsetCommit,
     handleDomGroupPathOffsetCommit,
@@ -160,6 +163,7 @@ export function DomEditProvider({
     commitAnimatedProperty,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     invalidateGsapCache,
     previewIframeRef,
     commitMutation,
@@ -187,6 +191,7 @@ export function DomEditProvider({
       clearDomSelection,
       handleDomStyleCommit,
       handleDomAttributeCommit,
+      handleDomAttributeLiveCommit,
       handleDomHtmlAttributeCommit,
       handleDomPathOffsetCommit,
       handleDomGroupPathOffsetCommit,
@@ -229,6 +234,7 @@ export function DomEditProvider({
       commitAnimatedProperty,
       handleSetArcPath,
       handleUpdateArcSegment,
+      handleUnroll,
       invalidateGsapCache,
       previewIframeRef,
       commitMutation: stableCommitMutation,
@@ -242,6 +248,7 @@ export function DomEditProvider({
       clearDomSelection,
       handleDomStyleCommit,
       handleDomAttributeCommit,
+      handleDomAttributeLiveCommit,
       handleDomHtmlAttributeCommit,
       handleDomPathOffsetCommit,
       handleDomGroupPathOffsetCommit,
@@ -284,6 +291,7 @@ export function DomEditProvider({
       commitAnimatedProperty,
       handleSetArcPath,
       handleUpdateArcSegment,
+      handleUnroll,
       invalidateGsapCache,
       previewIframeRef,
       stableCommitMutation,

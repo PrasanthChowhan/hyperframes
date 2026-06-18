@@ -227,6 +227,20 @@ describe("persist adapter", () => {
     expect(content).toContain("color: #f00");
   });
 
+  it("still persists when history:false (undo opt-out must not disable auto-save)", async () => {
+    const adapter = createMemoryAdapter();
+    const writeSpy = vi.spyOn(adapter, "write");
+
+    const comp = await openComposition(BASE_HTML, { persist: adapter, history: false });
+    expect(comp.canUndo()).toBe(false); // undo is off…
+    comp.setStyle("hf-title", { color: "#f00" });
+    await comp.flush();
+
+    expect(writeSpy).toHaveBeenCalled(); // …but the write still happened
+    const [, content] = writeSpy.mock.calls[0] as [string, string];
+    expect(content).toContain("color: #f00");
+  });
+
   it("surfaces persist errors via on('persist:error')", async () => {
     const adapter = createMemoryAdapter();
     const errors: unknown[] = [];
@@ -239,6 +253,33 @@ describe("persist adapter", () => {
 
     await new Promise((r) => setTimeout(r, 20));
     expect(errors).toHaveLength(1);
+  });
+
+  it("defaults the write path to composition.html when persistPath is omitted", async () => {
+    const adapter = createMemoryAdapter();
+    const writeSpy = vi.spyOn(adapter, "write");
+
+    const comp = await openComposition(BASE_HTML, { persist: adapter });
+    comp.setStyle("hf-title", { color: "#f00" });
+    await comp.flush();
+
+    const [path] = writeSpy.mock.calls[0] as [string, string];
+    expect(path).toBe("composition.html");
+  });
+
+  it("writes to persistPath when supplied", async () => {
+    const adapter = createMemoryAdapter();
+    const writeSpy = vi.spyOn(adapter, "write");
+
+    const comp = await openComposition(BASE_HTML, {
+      persist: adapter,
+      persistPath: "scenes/intro.html",
+    });
+    comp.setStyle("hf-title", { color: "#f00" });
+    await comp.flush();
+
+    const [path] = writeSpy.mock.calls[0] as [string, string];
+    expect(path).toBe("scenes/intro.html");
   });
 });
 

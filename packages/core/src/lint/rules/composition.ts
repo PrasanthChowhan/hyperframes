@@ -20,14 +20,14 @@ function countStructuralLines(source: string): number {
   return countPhysicalLines(source.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "<style></style>"));
 }
 
-function isRegistrySourceFile(filePath?: string): boolean {
+export function isRegistrySourceFile(filePath?: string): boolean {
   if (!filePath) return false;
 
   const normalized = filePath.replace(/\\/g, "/");
   return /(?:^|\/)registry\/blocks\/([^/]+)\/\1\.html$/i.test(normalized);
 }
 
-function isRegistryInstalledFile(rawSource: string): boolean {
+export function isRegistryInstalledFile(rawSource: string): boolean {
   return /^\s*<!--\s*hyperframes-registry-item:[^>]*-->/i.test(rawSource.slice(0, 512));
 }
 
@@ -80,6 +80,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   },
 
   // timeline_track_too_dense
+  // fallow-ignore-next-line complexity
   ({ tags, options }) => {
     const trackCounts = new Map<string, number>();
     for (const tag of tags) {
@@ -110,6 +111,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   },
 
   // timed_element_missing_visibility_hidden
+  // fallow-ignore-next-line complexity
   ({ tags }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const tag of tags) {
@@ -139,6 +141,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   },
 
   // deprecated_data_layer + deprecated_data_end
+  // fallow-ignore-next-line complexity
   ({ tags }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const tag of tags) {
@@ -146,7 +149,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
         const elementId = readAttr(tag.raw, "id") || undefined;
         findings.push({
           code: "deprecated_data_layer",
-          severity: "warning",
+          severity: "error",
           message: `<${tag.name}${elementId ? ` id="${elementId}"` : ""}> uses data-layer instead of data-track-index.`,
           elementId,
           fixHint: "Replace data-layer with data-track-index. The runtime reads data-track-index.",
@@ -157,7 +160,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
         const elementId = readAttr(tag.raw, "id") || undefined;
         findings.push({
           code: "deprecated_data_end",
-          severity: "warning",
+          severity: "error",
           message: `<${tag.name}${elementId ? ` id="${elementId}"` : ""}> uses data-end without data-duration. Use data-duration in source HTML.`,
           elementId,
           fixHint:
@@ -221,29 +224,8 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
     return findings;
   },
 
-  // external_script_dependency
-  ({ source }) => {
-    const findings: HyperframeLintFinding[] = [];
-    const externalScriptRe = /<script\b[^>]*\bsrc=["'](https?:\/\/[^"']+)["'][^>]*>/gi;
-    let match: RegExpExecArray | null;
-    const seen = new Set<string>();
-    while ((match = externalScriptRe.exec(source)) !== null) {
-      const src = match[1] ?? "";
-      if (seen.has(src)) continue;
-      seen.add(src);
-      findings.push({
-        code: "external_script_dependency",
-        severity: "info",
-        message: `This composition loads an external script from \`${src}\`. The HyperFrames bundler automatically hoists CDN scripts from sub-compositions into the parent document. In unbundled runtime mode, \`loadExternalCompositions\` re-injects them. If you're using a custom pipeline that bypasses both, you'll need to include this script manually.`,
-        fixHint:
-          "No action needed when using `hyperframes preview` or `hyperframes render`. If using a custom pipeline, add this script tag to your root composition or HTML page.",
-        snippet: truncateSnippet(match[0] ?? ""),
-      });
-    }
-    return findings;
-  },
-
   // timed_element_missing_clip_class
+  // fallow-ignore-next-line complexity
   ({ tags }) => {
     const findings: HyperframeLintFinding[] = [];
     const skipTags = new Set(["audio", "video", "script", "style", "template"]);
@@ -255,8 +237,8 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
 
       const hasStart = readAttr(tag.raw, "data-start") !== null;
       const hasDuration = readAttr(tag.raw, "data-duration") !== null;
-      const hasTrackIndex = readAttr(tag.raw, "data-track-index") !== null;
-      if (!hasStart && !hasDuration && !hasTrackIndex) continue;
+      // data-track-index alone marks a layer container, not a time-bounded clip
+      if (!hasStart && !hasDuration) continue;
 
       const classAttr = readAttr(tag.raw, "class") || "";
       const hasClip = classAttr.split(/\s+/).includes("clip");
@@ -265,7 +247,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       const elementId = readAttr(tag.raw, "id") || undefined;
       findings.push({
         code: "timed_element_missing_clip_class",
-        severity: "warning",
+        severity: "error",
         message: `<${tag.name}${elementId ? ` id="${elementId}"` : ""}> has timing attributes but no class="clip". The element will be visible for the entire composition instead of only during its scheduled time range.`,
         elementId,
         fixHint:
@@ -277,6 +259,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   },
 
   // overlapping_clips_same_track
+  // fallow-ignore-next-line complexity
   ({ tags }) => {
     const findings: HyperframeLintFinding[] = [];
 
@@ -338,7 +321,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
     if (!hasStart) {
       findings.push({
         code: "root_composition_missing_data_start",
-        severity: "warning",
+        severity: "error",
         message: `Root composition "${compId}" is missing data-start. The runtime needs data-start="0" on the root element to begin playback.`,
         fixHint: 'Add data-start="0" to the root composition element.',
         snippet: truncateSnippet(rootTag.raw),
@@ -355,7 +338,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
     if (trimmed.startsWith("<template")) {
       findings.push({
         code: "standalone_composition_wrapped_in_template",
-        severity: "warning",
+        severity: "error",
         message:
           "Root index.html is wrapped in a <template> tag. " +
           "Only sub-compositions loaded via data-composition-src should use <template> wrappers. " +
@@ -394,14 +377,15 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   },
 
   // requestanimationframe_in_composition
-  ({ scripts }) => {
+  ({ scripts, rawSource, options }) => {
+    if (isRegistrySourceFile(options.filePath) || isRegistryInstalledFile(rawSource)) return [];
     const findings: HyperframeLintFinding[] = [];
     for (const script of scripts) {
       const stripped = stripJsComments(script.content);
       if (/requestAnimationFrame\s*\(/.test(stripped)) {
         findings.push({
           code: "requestanimationframe_in_composition",
-          severity: "warning",
+          severity: "error",
           message:
             "`requestAnimationFrame` runs on wall-clock time, not the GSAP timeline. It will not sync with frame capture and may cause flickering or missed frames during rendering.",
           fixHint:
@@ -418,6 +402,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   // `data-variable-values`. The runtime swallows JSON errors silently and
   // falls back to declared defaults, which masks typos. This rule surfaces
   // the parse failure so authors notice before render time.
+  // fallow-ignore-next-line complexity
   ({ tags }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const tag of tags) {
@@ -431,7 +416,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
         const reason = err instanceof Error ? err.message : "unknown";
         findings.push({
           code: "invalid_variable_values_json",
-          severity: "warning",
+          severity: "error",
           message: `data-variable-values is not valid JSON (${reason}).`,
           fixHint:
             'Wrap the attribute value in single quotes and the JSON keys/values in double quotes, e.g. data-variable-values=\'{"title":"Hello"}\'.',
@@ -444,7 +429,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         findings.push({
           code: "invalid_variable_values_json",
-          severity: "warning",
+          severity: "error",
           message:
             'data-variable-values must be a JSON object keyed by variable id (e.g. {"title":"Hello"}).',
           fixHint:
@@ -462,6 +447,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
   // on any structural problem. Surface JSON / shape failures so authors
   // catch them at lint time rather than wondering why their `getVariables()`
   // defaults aren't applied.
+  // fallow-ignore-next-line complexity
   ({ source }) => {
     const htmlTag = findHtmlTag(source);
     if (!htmlTag) return [];
@@ -476,7 +462,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       return [
         {
           code: "invalid_composition_variables_declaration",
-          severity: "warning",
+          severity: "error",
           message: `data-composition-variables is not valid JSON (${reason}).`,
           fixHint:
             'Provide a JSON array of variable declarations: data-composition-variables=\'[{"id":"title","type":"string","label":"Title","default":"Hello"}]\'.',
@@ -489,7 +475,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       return [
         {
           code: "invalid_composition_variables_declaration",
-          severity: "warning",
+          severity: "error",
           message: "data-composition-variables must be a JSON array of variable declarations.",
           fixHint:
             'Wrap declarations in [] and give each an id, type, label, and default: \'[{"id":"title","type":"string","label":"Title","default":"Hello"}]\'.',
@@ -505,7 +491,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
         findings.push({
           code: "invalid_composition_variables_declaration",
-          severity: "warning",
+          severity: "error",
           message: `data-composition-variables entry [${i}] must be an object with id, type, label, and default.`,
           snippet: truncateSnippet(htmlTag.raw),
         });
@@ -520,11 +506,73 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
       if (missing.length > 0) {
         findings.push({
           code: "invalid_composition_variables_declaration",
-          severity: "warning",
+          severity: "error",
           message: `data-composition-variables entry [${i}] is missing or has invalid: ${missing.join(", ")}. Type must be one of string, number, color, boolean, enum.`,
           snippet: truncateSnippet(htmlTag.raw),
         });
       }
+    }
+    return findings;
+  },
+
+  // subcomposition_blanks_before_host
+  // Warns when a full-bleed sub-composition slot ends before the host composition
+  // does, leaving the slot blank for the remainder (issue #1540). Scoped narrowly to
+  // the high-signal shape — a sole/dominant external mount starting at ~0 — so it
+  // stays silent on intentional short clips (an intro followed by other clips that
+  // carry the timeline forward).
+  // fallow-ignore-next-line complexity
+  ({ tags, rootTag }) => {
+    if (!rootTag) return [];
+    const rootDuration = Number(readAttr(rootTag.raw, "data-duration"));
+    if (!Number.isFinite(rootDuration) || rootDuration <= 0) return [];
+
+    // Two independent knobs that happen to share a 0.5s magnitude. Tuned for
+    // real hosts (tens to hundreds of seconds); on a very short host (~6s) the
+    // EPSILON slack would let a ~10% blank tail pass unflagged — acceptable
+    // because the silent-blank trap this rule targets only matters at scale.
+    const EPSILON = 0.5; // seconds; tolerance for "ends/covers near the host end"
+    const START_TOLERANCE = 0.5; // seconds; "starts at the composition start"
+    const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+    // Timed children of the root. An element with data-start but no usable
+    // data-duration is treated as covering the tail (end = Infinity), so an
+    // unknown-length sibling suppresses the warning rather than triggering it.
+    const timed = tags
+      .filter((tag) => tag.index !== rootTag.index && readAttr(tag.raw, "data-start") !== null)
+      .map((tag) => {
+        const start = Number(readAttr(tag.raw, "data-start")) || 0;
+        const dur = Number(readAttr(tag.raw, "data-duration"));
+        const end = Number.isFinite(dur) && dur > 0 ? start + dur : Infinity;
+        return { tag, start, end };
+      });
+
+    // `tags` is a flat list (no nesting depth), so a timed element nested
+    // *inside* a candidate slot is treated as a tail-covering sibling rather
+    // than a descendant. Acceptable: external src mounts are empty by
+    // convention (content is loaded from the linked file), so the only
+    // false-negative path is rare and matches the flat-tag scope of the
+    // sibling rules in this file.
+    const tailCovered = (exceptIndex: number) =>
+      timed.some((t) => t.tag.index !== exceptIndex && t.end >= rootDuration - EPSILON);
+
+    const findings: HyperframeLintFinding[] = [];
+    for (const t of timed) {
+      if (readAttr(t.tag.raw, "data-composition-src") === null) continue; // external slot only
+      if (t.start > START_TOLERANCE) continue; // must start at the composition start
+      if (!Number.isFinite(t.end)) continue; // known, finite slot length
+      if (t.end >= rootDuration - EPSILON) continue; // already fills the host window
+      if (tailCovered(t.tag.index)) continue; // another clip covers the tail — not full-bleed
+      const elementId = readAttr(t.tag.raw, "id") || undefined;
+      const gap = round3(rootDuration - t.end);
+      findings.push({
+        code: "subcomposition_blanks_before_host",
+        severity: "warning",
+        message: `<${t.tag.name}${elementId ? ` id="${elementId}"` : ""}> sub-composition ends at ${round3(t.end)}s but the composition runs to ${round3(rootDuration)}s — its slot will be blank for ~${gap}s.`,
+        elementId,
+        fixHint: `data-duration is the slot's visible window. Set this sub-composition's data-duration to ${round3(rootDuration - t.start)} to fill the host window, or add another clip to cover the remaining ~${gap}s.`,
+        snippet: truncateSnippet(t.tag.raw),
+      });
     }
     return findings;
   },

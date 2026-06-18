@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Eye, Layers, Move, X } from "../../icons/SystemIcons";
 import { useStudioShellContext } from "../../contexts/StudioContext";
 import { readStudioBoxSize, readStudioPathOffset, readStudioRotation } from "./manualEdits";
@@ -14,11 +14,19 @@ import { MetricField, Section } from "./propertyPanelPrimitives";
 import { createTransformCommitHandlers } from "./propertyPanelTransformCommit";
 import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
 import { isMediaElement, MediaSection } from "./propertyPanelMediaSection";
+import {
+  ColorGradingSection,
+  isColorGradingCapableElement,
+} from "./propertyPanelColorGradingSection";
 import { TextSection, StyleSections } from "./propertyPanelSections";
 import { GsapAnimationSection } from "./GsapAnimationSection";
 import { PropertyPanel3dTransform } from "./propertyPanel3dTransform";
 import { KeyframeNavigation } from "./KeyframeNavigation";
-import { STUDIO_GSAP_PANEL_ENABLED, STUDIO_KEYFRAMES_ENABLED } from "./manualEditingAvailability";
+import {
+  STUDIO_COLOR_GRADING_ENABLED,
+  STUDIO_GSAP_PANEL_ENABLED,
+  STUDIO_KEYFRAMES_ENABLED,
+} from "./manualEditingAvailability";
 import { usePlayerStore, liveTime } from "../../player";
 import { TimingSection } from "./propertyPanelTimingSection";
 import { type PropertyPanelProps } from "./propertyPanelHelpers";
@@ -47,6 +55,7 @@ export const PropertyPanel = memo(function PropertyPanel({
   onClearSelection,
   onSetStyle,
   onSetAttribute,
+  onSetAttributeLive,
   onSetHtmlAttribute,
   onSetManualOffset,
   onSetManualSize,
@@ -74,6 +83,7 @@ export const PropertyPanel = memo(function PropertyPanel({
   onAddGsapAnimation,
   onSetArcPath,
   onUpdateArcSegment,
+  onUnroll,
   onAddKeyframe,
   onRemoveKeyframe,
   onConvertToKeyframes,
@@ -110,6 +120,29 @@ export const PropertyPanel = memo(function PropertyPanel({
   const currentTime = isPlaying ? liveTimeRef.current : storeTime;
   const cacheElementKey = element?.id ?? element?.selector ?? "";
   const cacheEntry = usePlayerStore((s) => s.keyframeCache.get(cacheElementKey));
+
+  const iframeRef = previewIframeRef ?? { current: null };
+  const gsapAnimIdForMemo = element
+    ? (gsapAnimations?.find((a: { keyframes?: unknown }) => a.keyframes)?.id ??
+      gsapAnimations?.[0]?.id ??
+      null)
+    : null;
+  const gsapRuntimeValues = useMemo(
+    () =>
+      element
+        ? readGsapRuntimeValuesForPanel(gsapAnimIdForMemo, gsapAnimations, element, iframeRef)
+        : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- iframeRef is stable; currentTime drives re-reads during playback
+    [gsapAnimIdForMemo, gsapAnimations, element, currentTime],
+  );
+  const gsapBorderRadius = useMemo(
+    () =>
+      element
+        ? readGsapBorderRadiusForPanel(gsapRuntimeValues, gsapAnimations, element, iframeRef)
+        : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [gsapRuntimeValues, gsapAnimations, element, currentTime],
+  );
 
   if (!element) {
     return (
@@ -193,21 +226,6 @@ export const PropertyPanel = memo(function PropertyPanel({
     if (groupAnim) return groupAnim.id;
     return gsapAnimId ?? "";
   };
-
-  // Read ALL GSAP-interpolated values at the current seek time.
-  const gsapRuntimeValues = readGsapRuntimeValuesForPanel(
-    gsapAnimId,
-    gsapAnimations,
-    element,
-    previewIframeRef ?? { current: null },
-  );
-
-  const gsapBorderRadius = readGsapBorderRadiusForPanel(
-    gsapRuntimeValues,
-    gsapAnimations,
-    element,
-    previewIframeRef ?? { current: null },
-  );
 
   const displayX = gsapRuntimeValues?.x ?? manualOffset.x;
   const displayY = gsapRuntimeValues?.y ?? manualOffset.y;
@@ -343,6 +361,22 @@ export const PropertyPanel = memo(function PropertyPanel({
             onSetStyle={onSetStyle}
             onSetAttribute={onSetAttribute}
             onSetHtmlAttribute={onSetHtmlAttribute}
+          />
+        )}
+
+        {STUDIO_COLOR_GRADING_ENABLED && isColorGradingCapableElement(element) && (
+          <ColorGradingSection
+            key={[
+              element.id ?? "",
+              element.hfId ?? "",
+              element.selector ?? "",
+              String(element.selectorIndex ?? ""),
+            ].join("|")}
+            element={element}
+            assets={assets}
+            previewIframeRef={previewIframeRef}
+            onImportAssets={onImportAssets}
+            onSetAttributeLive={onSetAttributeLive}
           />
         )}
 
@@ -523,6 +557,7 @@ export const PropertyPanel = memo(function PropertyPanel({
               onAddAnimation={onAddGsapAnimation}
               onSetArcPath={onSetArcPath}
               onUpdateArcSegment={onUpdateArcSegment}
+              onUnroll={onUnroll}
             />
           )}
 

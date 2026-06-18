@@ -1,5 +1,6 @@
 import { FONT_ALIAS_KEYS, resolveAliasDisplayName } from "../../fonts/aliases";
 import type { LintContext, HyperframeLintFinding } from "../context";
+import { isRegistrySourceFile, isRegistryInstalledFile } from "./composition";
 
 const GENERIC_FAMILIES = new Set([
   "serif",
@@ -21,13 +22,25 @@ const GENERIC_FAMILIES = new Set([
   "revert",
 ]);
 
+// A CSS comment can contain a `}` (e.g. `@font-face { /* 400 } regular */
+// font-family: 'X'; ... }`), which truncates the naive `@font-face\s*\{[^}]*\}`
+// block match at the comment's brace — so the rule never sees the real
+// `font-family` and reports a false-positive font_family_without_font_face.
+// Large/"framework" stylesheets hit this far more often than minimal ones,
+// which is why a simple <style> passes while a complex one fails. Strip
+// comments before scanning so a brace inside one cannot split a block. See #1534.
+function stripCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, " ");
+}
+
 function extractFontFaceFamilies(styles: Array<{ content: string }>): Set<string> {
   const families = new Set<string>();
   const fontFaceRe = /@font-face\s*\{[^}]*\}/gi;
   const familyRe = /font-family\s*:\s*(['"]?)([^;'"]+)\1/i;
   for (const style of styles) {
+    const content = stripCssComments(style.content);
     let match: RegExpExecArray | null;
-    while ((match = fontFaceRe.exec(style.content)) !== null) {
+    while ((match = fontFaceRe.exec(content)) !== null) {
       const familyMatch = match[0].match(familyRe);
       if (familyMatch?.[2]) {
         families.add(familyMatch[2].trim().toLowerCase());
@@ -42,7 +55,7 @@ function extractUsedFontFamilies(styles: Array<{ content: string }>): string[] {
   const seen = new Set<string>();
   const propRe = /font-family\s*:\s*([^;}{]+)/gi;
   for (const style of styles) {
-    const withoutFontFace = style.content.replace(/@font-face\s*\{[^}]*\}/gi, "");
+    const withoutFontFace = stripCssComments(style.content).replace(/@font-face\s*\{[^}]*\}/gi, "");
     let match: RegExpExecArray | null;
     while ((match = propRe.exec(withoutFontFace)) !== null) {
       const stack = match[1]!;
@@ -76,7 +89,8 @@ function collectAliasedFonts(used: string[], declared: Set<string>): string[] {
 
 export const fontRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   // google_fonts_import
-  ({ styles, source }) => {
+  ({ styles, source, rawSource, options }) => {
+    if (isRegistrySourceFile(options.filePath) || isRegistryInstalledFile(rawSource)) return [];
     const findings: HyperframeLintFinding[] = [];
     const googleFontsInLink = /<link\b[^>]*fonts\.googleapis\.com[^>]*>/i.test(source);
     const googleFontsInImport = styles.some((s) =>
@@ -86,7 +100,7 @@ export const fontRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     if (googleFontsInLink || googleFontsInImport) {
       findings.push({
         code: "google_fonts_import",
-        severity: "warning",
+        severity: "error",
         message:
           "Composition loads fonts from fonts.googleapis.com. External font requests " +
           "fail in sandboxed/offline renders and add latency. Use local @font-face " +
@@ -123,7 +137,8 @@ export const fontRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   },
 
   // font_family_without_font_face
-  ({ styles }) => {
+  ({ styles, rawSource, options }) => {
+    if (isRegistrySourceFile(options.filePath) || isRegistryInstalledFile(rawSource)) return [];
     const findings: HyperframeLintFinding[] = [];
     const declared = extractFontFaceFamilies(styles);
     const used = extractUsedFontFamilies(styles);
@@ -133,7 +148,7 @@ export const fontRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
     findings.push({
       code: "font_family_without_font_face",
-      severity: "warning",
+      severity: "error",
       message:
         `Font ${undeclared.length === 1 ? "family" : "families"} used without @font-face declaration: ${undeclared.join(", ")}. ` +
         "These are not in the auto-resolved font list, so the renderer cannot supply them automatically. " +

@@ -4,6 +4,9 @@ import type { EditHistoryKind } from "../utils/editHistory";
 import type { RightPanelTab } from "../utils/studioHelpers";
 import type { PatchTarget } from "../utils/sourcePatcher";
 import type { SidebarTab } from "../components/sidebar/LeftSidebar";
+import type { Composition } from "@hyperframes/sdk";
+import { sdkCutoverPersist, sdkDeletePersist } from "../utils/sdkCutover";
+import { runResolverShadow, recordResolverParity } from "../utils/sdkResolverShadow";
 import { useAskAgentModal } from "./useAskAgentModal";
 import { useDomSelection } from "./useDomSelection";
 import { usePreviewInteraction } from "./usePreviewInteraction";
@@ -58,6 +61,8 @@ export interface UseDomEditSessionParams {
   openSourceForSelection?: (sourceFile: string, target: PatchTarget) => void;
   selectSidebarTab?: (tab: SidebarTab) => void;
   getSidebarTab?: () => SidebarTab;
+  sdkSession?: Composition | null;
+  forceReloadSdkSession?: () => void;
 }
 
 // ── Hook ──
@@ -96,6 +101,8 @@ export function useDomEditSession({
   openSourceForSelection,
   selectSidebarTab,
   getSidebarTab,
+  sdkSession,
+  forceReloadSdkSession,
 }: UseDomEditSessionParams) {
   void _setRefreshKey;
   void _readProjectFile;
@@ -189,6 +196,9 @@ export function useDomEditSession({
     onCacheInvalidate: bumpGsapCache,
     onFileContentChanged: updateEditingFileContent,
     showToast,
+    sdkSession,
+    writeProjectFile,
+    forceReloadSdkSession,
   });
 
   // ── DOM commit handlers ──
@@ -197,6 +207,7 @@ export function useDomEditSession({
     resolveImportedFontAsset,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomTextCommit,
     handleDomTextFieldStyleCommit,
@@ -227,6 +238,46 @@ export function useDomEditSession({
     clearDomSelection,
     refreshDomEditSelectionFromPreview,
     buildDomSelectionFromTarget,
+    forceReloadSdkSession,
+    onTrySdkPersist: sdkSession
+      ? (selection, operations, originalContent, targetPath, options) => {
+          // Resolver shadow runs regardless of the cutover flag — decoupled tripwire.
+          runResolverShadow(sdkSession, selection.hfId, operations);
+          return sdkCutoverPersist(
+            selection,
+            operations,
+            originalContent,
+            targetPath,
+            sdkSession,
+            {
+              editHistory,
+              writeProjectFile,
+              reloadPreview,
+              domEditSaveTimestampRef,
+              compositionPath: activeCompPath,
+            },
+            options,
+          );
+        }
+      : undefined,
+    onTrySdkDelete: sdkSession
+      ? (hfId, originalContent, targetPath) =>
+          sdkDeletePersist(hfId, originalContent, targetPath, sdkSession, {
+            editHistory,
+            writeProjectFile,
+            reloadPreview,
+            domEditSaveTimestampRef,
+            compositionPath: activeCompPath,
+          })
+      : undefined,
+    // Resolver shadow for the z-index reorder edit: it takes the server path (no
+    // SDK persist), but the tripwire is decoupled from cutover — record whether
+    // the SDK resolves each reordered element (the reorderElements op's targets).
+    onReorderShadow: sdkSession
+      ? (targets: string[]) => {
+          for (const target of targets) recordResolverParity(sdkSession, target, "reorderElements");
+        }
+      : undefined,
   });
 
   // ── Wiring: selection sync, GSAP cache, preview sync, selection handlers ──
@@ -255,6 +306,7 @@ export function useDomEditSession({
     handleGsapRemoveAllKeyframes,
     handleResetSelectedElementKeyframes,
   } = useDomEditWiring({
+    // fallow-ignore-next-line code-duplication
     projectId,
     activeCompPath,
     domEditSelection,
@@ -321,6 +373,7 @@ export function useDomEditSession({
     commitAnimatedProperty,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     commitMutation,
   } = useGsapAwareEditing({
     domEditSelection,
@@ -360,6 +413,7 @@ export function useDomEditSession({
     clearDomSelection,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomPathOffsetCommit: handleGsapAwarePathOffsetCommit,
     handleDomGroupPathOffsetCommit,
@@ -407,6 +461,7 @@ export function useDomEditSession({
     commitAnimatedProperty,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     invalidateGsapCache: bumpGsapCache,
     previewIframeRef,
     commitMutation,

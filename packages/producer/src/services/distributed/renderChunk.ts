@@ -65,7 +65,12 @@ import {
 } from "../render/stages/freezePlan.js";
 import { sha256Hex } from "../render/stages/planHash.js";
 import { applyRuntimeEnvSnapshot } from "../render/runtimeEnvSnapshot.js";
-import { buildVirtualTimeShim, createFileServer, type FileServerHandle } from "../fileServer.js";
+import {
+  buildVirtualTimeShim,
+  closeFileServerSafely,
+  createFileServer,
+  type FileServerHandle,
+} from "../fileServer.js";
 import {
   buildSyntheticRenderJob,
   type DistributedFormat,
@@ -568,6 +573,9 @@ export async function renderChunk(
         probeSession: session,
         needsAlpha: plan.dimensions.format !== "mp4",
         captureAttempts: [],
+        // Distributed chunks run on Linux (beginframe) where dedup never arms;
+        // a throwaway sink satisfies the type without per-chunk dedup reporting.
+        dedupPerfs: [],
         buildCaptureOptions: () => captureOptions,
         createRenderVideoFrameInjector: () => videoInjector,
         abortSignal: undefined,
@@ -654,7 +662,7 @@ export async function renderChunk(
           });
         }
       }
-      fileServer.close();
+      closeFileServerSafely(fileServer, "renderChunk", log);
       // Leave the temp work dir on failure (helps debugging); remove it on
       // success below.
     }

@@ -1,6 +1,8 @@
 import type { RuntimeTimelineMessage, RuntimeTimelineLike } from "./types";
+import type { RuntimeColorGradingApi } from "./colorGrading";
 import type { HyperframePickerApi } from "../inline-scripts/pickerApi";
 import type { PlayerAPI } from "../core.types";
+import type { ClipTree } from "./clipTree";
 
 type ThreeClockLike = {
   elapsedTime: number;
@@ -29,6 +31,11 @@ declare global {
     __timelines: Record<string, RuntimeTimelineLike>;
     __player?: PlayerAPI;
     __clipManifest?: RuntimeTimelineMessage;
+    __clipTree?: ClipTree;
+    __hf?: {
+      colorGrading?: RuntimeColorGradingApi;
+      onSwallowed?: (label: string, err: unknown) => void;
+    };
     __playerReady?: boolean;
     __renderReady?: boolean;
     __hfRuntimeTeardown?: (() => void) | null;
@@ -95,6 +102,36 @@ declare global {
      *   window.__hfLottie.push(anim);
      */
     __hfLottie?: unknown[];
+    /**
+     * Mapbox GL JS map instances. Push your map here after creating it:
+     *   window.__hfMapbox = window.__hfMapbox || [];
+     *   window.__hfMapbox.push(map);
+     */
+    __hfMapbox?: unknown[];
+    /**
+     * Leaflet map instances. Push your map here after creating it:
+     *   window.__hfLeaflet = window.__hfLeaflet || [];
+     *   window.__hfLeaflet.push(map);
+     */
+    __hfLeaflet?: unknown[];
+    /**
+     * Google Maps instances. Push your map here after creating it:
+     *   window.__hfGoogleMaps = window.__hfGoogleMaps || [];
+     *   window.__hfGoogleMaps.push(map);
+     */
+    __hfGoogleMaps?: unknown[];
+    /**
+     * MapLibre GL JS map instances. Push your map here after creating it:
+     *   window.__hfMaplibre = window.__hfMaplibre || [];
+     *   window.__hfMaplibre.push(map);
+     */
+    __hfMaplibre?: unknown[];
+    /**
+     * D3 transition instances. Push your transition here after creating it:
+     *   window.__hfD3 = window.__hfD3 || [];
+     *   window.__hfD3.push(transition);
+     */
+    __hfD3?: unknown[];
     /**
      * Render-time variable overrides injected by the engine when the user
      * passes `hyperframes render --variables '<json>'`. Read indirectly via

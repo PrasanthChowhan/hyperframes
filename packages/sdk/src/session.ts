@@ -39,6 +39,8 @@ import type { PersistQueueModule } from "./persist-queue.js";
 
 export interface OpenCompositionOptions {
   persist?: PersistAdapter;
+  /** Adapter path the persist queue writes to. Default: "composition.html". Immutable for the session lifetime. */
+  persistPath?: string;
   preview?: PreviewAdapter;
   /** T3 embedded mode: override-set applied on top of the base template. */
   overrides?: OverrideSet;
@@ -46,6 +48,12 @@ export interface OpenCompositionOptions {
   trackedOrigins?: unknown[];
   /** Auto-coalesce window for history entries (ms). Default: 300. */
   coalesceMs?: number;
+  /**
+   * Pass `false` to skip attaching the history module (undo/redo).
+   * Default: history is attached in standalone (non-embedded) mode.
+   * Use when the host owns the undo stack and SDK undo is dead weight.
+   */
+  history?: false;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -224,6 +232,17 @@ class CompositionImpl implements Composition {
     return [...this.currentSelection];
   }
 
+  setSelection(ids: string[]): void {
+    const deduped = Array.from(new Set(ids));
+    if (
+      deduped.length === this.currentSelection.length &&
+      deduped.every((id, i) => id === this.currentSelection[i])
+    ) {
+      return;
+    }
+    this.updateSelection(deduped);
+  }
+
   private updateSelection(ids: readonly string[]): void {
     this.currentSelection = [...ids];
     for (const handler of this.selectionHandlers) {
@@ -278,7 +297,13 @@ class CompositionImpl implements Composition {
       this.batchInverse.push(...inverse);
       if (!this.batchOpTypes.includes(op.type)) this.batchOpTypes.push(op.type);
     } else {
-      const event = buildPatchEvent(forward, inverse, origin, [op.type]);
+      // Reverse the inverse list (parity with batch() below): an op that emits
+      // multiple patches whose undo order matters — same path (reorderElements
+      // with a duplicate target), an aliased multi-target, or a nested
+      // parent+child removeElement — must undo in reverse application order, or
+      // undo lands on an intermediate value / drops a subtree. Harmless for the
+      // common single-patch / independent-path case.
+      const event = buildPatchEvent(forward, [...inverse].reverse(), origin, [op.type]);
       this.patchHandlers.forEach((h) => h(event));
       this.changeHandlers.forEach((h) => h());
     }
@@ -483,14 +508,20 @@ export async function openComposition(
   const isEmbedded = opts?.overrides !== undefined;
 
   if (!isEmbedded) {
-    const history = createHistory(session, {
-      coalesceMs: opts?.coalesceMs ?? 300,
-      trackedOrigins: opts?.trackedOrigins,
-    });
-    session.attachHistory(history);
+    // history:false opts out of the SDK undo stack ONLY. Persist (auto-save) is
+    // independent — gating it on the history flag too would silently drop every
+    // disk write for a caller that just wanted to disable undo (data loss).
+    if (opts?.history !== false) {
+      const history = createHistory(session, {
+        coalesceMs: opts?.coalesceMs ?? 300,
+        trackedOrigins: opts?.trackedOrigins,
+      });
+      session.attachHistory(history);
+    }
 
     if (opts?.persist) {
       const pq = createPersistQueue(session, opts.persist, {
+        path: opts.persistPath,
         onError: (e) => session._fireError(e),
       });
       session.attachPersistQueue(pq);

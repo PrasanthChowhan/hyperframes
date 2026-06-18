@@ -13,7 +13,7 @@
 import { describe, it, expect } from "vitest";
 import { parseHTML } from "linkedom";
 import { ensureHfIds } from "@hyperframes/core/hf-ids";
-import { resolveScoped } from "./engine/model.js";
+import { resolveScoped, findById } from "./engine/model.js";
 import { parseMutable } from "./engine/model.js";
 import { buildRoots, flatElements } from "./document.js";
 import { openComposition } from "./session.js";
@@ -48,6 +48,53 @@ describe("resolveScoped — flat id", () => {
       `<!DOCTYPE html><html><body><div data-hf-id="hf-aaaa"></div></body></html>`,
     );
     expect(resolveScoped(doc as unknown as Document, "hf-xxxx")).toBeNull();
+  });
+
+  // A sub-composition ROOT is addressed by its composition id. When no element
+  // carries that as a data-hf-id, fall back to [data-composition-id]: comp-ids
+  // become first-class resolvable addresses (fixes validate / getElement).
+  it("resolves a bare id to a sub-comp root via data-composition-id fallback", () => {
+    const doc = makeDoc(
+      `<!DOCTYPE html><html><body><div data-hf-id="hf-host" data-composition-id="sub-1"></div></body></html>`,
+    ) as unknown as Document;
+    const viaComp = resolveScoped(doc, "sub-1");
+    const viaHf = resolveScoped(doc, "hf-host");
+    expect(viaComp).not.toBeNull();
+    expect(viaComp?.getAttribute("data-hf-id")).toBe("hf-host");
+    // Both addresses resolve to the SAME host element.
+    expect(viaComp).toBe(viaHf);
+  });
+
+  // data-hf-id MUST take precedence: a bare id that matches a real data-hf-id
+  // never falls back to data-composition-id, even if some other element carries
+  // that string as its composition id.
+  it("data-hf-id takes precedence over data-composition-id for a bare id", () => {
+    const doc = makeDoc(
+      `<!DOCTYPE html><html><body>
+        <div data-hf-id="dup" class="byHfId"></div>
+        <div data-hf-id="hf-host" data-composition-id="dup" class="byCompId"></div>
+      </body></html>`,
+    ) as unknown as Document;
+    const el = resolveScoped(doc, "dup");
+    expect(el?.getAttribute("class")).toBe("byHfId");
+  });
+
+  // Regression: findById is the patch-replay/undo resolver. It must agree with
+  // resolveScoped (forward dispatch) on an ambiguous bare id — both pick the
+  // canonical (top-level) instance — or undo reverts the wrong duplicate.
+  it("findById resolves an ambiguous bare id to the canonical instance (== resolveScoped)", () => {
+    const doc = makeDoc(
+      inlinedHtml(`
+      <div data-hf-id="hf-host" data-composition-file="sub.html">
+        <p data-hf-id="hf-dup" class="inside">inside</p>
+      </div>
+      <p data-hf-id="hf-dup" class="outside">outside</p>
+    `),
+    ) as unknown as Document;
+    const viaFind = findById(doc, "hf-dup");
+    const viaResolve = resolveScoped(doc, "hf-dup");
+    expect(viaFind).toBe(viaResolve);
+    expect(viaFind?.getAttribute("class")).toBe("outside");
   });
 });
 
@@ -287,6 +334,33 @@ describe("dispatch — scoped target", () => {
   });
 });
 
+// ─── 3b. Comp-root GSAP tween attribution ─────────────────────────────────────
+
+describe("sub-comp root GSAP tween — canonical hf-id attribution", () => {
+  it("getElement(host).animationIds includes a tween added by comp-id target", async () => {
+    const html = inlinedHtml(`
+      <div data-hf-id="hf-root" data-hf-root>
+        <div data-hf-id="hf-host" data-composition-id="sub-1" data-composition-file="sub.html">
+          <p data-hf-id="hf-leaf">text</p>
+        </div>
+        <script>var tl = gsap.timeline({ paused: true });
+window.__timelines = { t: tl };</script>
+      </div>
+    `);
+    const comp = await openComposition(html);
+    // Target the sub-comp ROOT by its composition id.
+    const animId = comp.addGsapTween("sub-1", {
+      method: "to",
+      duration: 0.3,
+      properties: { x: 200 },
+    });
+    // The tween is filed under the host's own data-hf-id (canonical form), so
+    // it surfaces on the host element snapshot.
+    const host = comp.getElement("hf-host");
+    expect(host?.animationIds).toContain(animId);
+  });
+});
+
 // ─── 4. Override-set keys for scoped ids ──────────────────────────────────────
 
 describe("override-set — scoped id keys", () => {
@@ -363,6 +437,70 @@ describe("find({ composition })", () => {
     const comp = await openComposition(html);
     const ids = comp.find({ composition: "hf-host", tag: "p" });
     expect(ids).toEqual(["hf-host/hf-a"]);
+  });
+});
+
+// ─── 5b. Ambiguous bare id: removeElement / getElement agreement ──────────────
+
+describe("ambiguous bare id — removeElement and getElement agree", () => {
+  // Inner sub-comp dup appears FIRST in document order; the canonical top-level
+  // dup appears AFTER it. querySelector document-order would return the inner one,
+  // but getElement prefers the canonical (top-level) match. The two APIs must agree.
+  const ambiguousHtml = () =>
+    inlinedHtml(`
+      <div data-hf-id="hf-root" data-hf-root>
+        <div data-hf-id="hf-host" data-composition-file="sub.html">
+          <p data-hf-id="hf-dup" class="inner">inner</p>
+        </div>
+        <p data-hf-id="hf-dup" class="outer">outer</p>
+      </div>
+    `);
+
+  it("bare id resolves to the canonical (top-level) instance, matching getElement", async () => {
+    const comp = await openComposition(ambiguousHtml());
+
+    // getElement prefers the canonical match (scopedId === id) → top-level "outer".
+    const got = comp.getElement("hf-dup");
+    expect(got?.scopedId).toBe("hf-dup");
+    expect(got?.classNames).toContain("outer");
+
+    // removeElement(bareId) must remove the SAME instance getElement returned.
+    comp.removeElement("hf-dup");
+
+    // The canonical top-level instance is gone — getElement(bareId) no longer
+    // finds it (and does NOT silently fall through to the inner sub-comp dup).
+    expect(comp.getElement("hf-dup")).toBeNull();
+
+    // The inner instance survives, addressable only via its fully-scoped path.
+    const inner = comp.getElement("hf-host/hf-dup");
+    expect(inner?.classNames).toContain("inner");
+  });
+
+  it("fully-scoped path still targets the inner instance exactly", async () => {
+    const comp = await openComposition(ambiguousHtml());
+    comp.removeElement("hf-host/hf-dup");
+
+    // Inner gone; canonical top-level survives.
+    const inner = comp.getElement("hf-host/hf-dup");
+    expect(inner).toBeNull();
+    const top = comp.getElement("hf-dup");
+    expect(top?.scopedId).toBe("hf-dup");
+    expect(top?.classNames).toContain("outer");
+  });
+
+  it("non-duplicated bare id still resolves and removes normally", async () => {
+    const html = inlinedHtml(`
+      <div data-hf-id="hf-root" data-hf-root>
+        <div data-hf-id="hf-host" data-composition-file="sub.html">
+          <p data-hf-id="hf-leaf">inside</p>
+        </div>
+        <p data-hf-id="hf-solo">solo</p>
+      </div>
+    `);
+    const comp = await openComposition(html);
+    expect(comp.getElement("hf-solo")?.scopedId).toBe("hf-solo");
+    comp.removeElement("hf-solo");
+    expect(comp.getElement("hf-solo")).toBeNull();
   });
 });
 

@@ -34,8 +34,7 @@ export type { PersistQueueModule, PersistQueueOptions } from "./persist-queue.js
 
 export type { PersistAdapter, PreviewAdapter, PersistVersionEntry } from "./adapters/types.js";
 
-// Concrete adapter factories.
+// Concrete adapter factories (browser-safe — Node-only fs adapter: @hyperframes/sdk/adapters/fs).
 export { createMemoryAdapter } from "./adapters/memory.js";
 export { createHeadlessAdapter } from "./adapters/headless.js";
-export { createFsAdapter } from "./adapters/fs.js";
-export type { FsAdapterOptions } from "./adapters/fs.js";
+export { createIframePreviewAdapter, resolveNearestHfElement } from "./adapters/iframe.js";

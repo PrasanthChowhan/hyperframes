@@ -82,6 +82,11 @@ export type EditOp =
   | { type: "setHold"; target: HfId | HfId[]; hold: ElasticHold }
   | { type: "moveElement"; target: HfId | HfId[]; x: number; y: number }
   | { type: "removeElement"; target: HfId | HfId[] }
+  | {
+      type: "reorderElements";
+      /** Each entry sets inline zIndex on one element. Positioning is unchanged — z-index only takes effect on non-static elements, so the caller must ensure the target is positioned. */
+      entries: Array<{ target: HfId; zIndex: number }>;
+    }
   | { type: "setClassStyle"; selector: string; styles: Record<string, string | null> }
   | { type: "setCompositionMetadata"; width?: number; height?: number; duration?: number }
   | { type: "setVariableValue"; id: string; value: string | number | boolean }
@@ -101,10 +106,71 @@ export type EditOp =
       position: number;
       value: Record<string, unknown>;
     }
-  | { type: "removeGsapKeyframe"; animationId: string; keyframeIndex: number }
+  | { type: "removeGsapKeyframe"; animationId: string; percentage: number }
+  | { type: "removeGsapProperty"; animationId: string; property: string; from?: boolean }
   | { type: "removeGsapTween"; animationId: string }
+  | { type: "removeAllKeyframes"; animationId: string }
+  | {
+      type: "convertToKeyframes";
+      animationId: string;
+      resolvedFromValues?: Record<string, number | string>;
+    }
+  | { type: "deleteAllForSelector"; selector: string }
+  | {
+      type: "materializeKeyframes";
+      animationId: string;
+      keyframes: Array<{
+        percentage: number;
+        properties: Record<string, number | string>;
+        ease?: string;
+      }>;
+      easeEach?: string;
+      resolvedSelector?: string;
+    }
+  | { type: "splitIntoPropertyGroups"; animationId: string }
+  | {
+      type: "splitAnimations";
+      originalId: string;
+      newId: string;
+      splitTime: number;
+      elementStart: number;
+      elementDuration: number;
+    }
   | { type: "addLabel"; name: string; position: number }
-  | { type: "removeLabel"; name: string };
+  | { type: "removeLabel"; name: string }
+  | {
+      type: "setArcPath";
+      animationId: string;
+      config: {
+        enabled: boolean;
+        autoRotate: boolean | number;
+        segments: Array<{
+          curviness?: number;
+          cp1?: { x: number; y: number };
+          cp2?: { x: number; y: number };
+        }>;
+      };
+    }
+  | {
+      type: "updateArcSegment";
+      animationId: string;
+      segmentIndex: number;
+      update: {
+        curviness?: number;
+        cp1?: { x: number; y: number };
+        cp2?: { x: number; y: number };
+      };
+    }
+  | { type: "removeArcPath"; animationId: string }
+  | {
+      type: "unrollDynamicAnimations";
+      animationId: string;
+      elements: Array<{
+        selector: string;
+        keyframes: Array<{ percentage: number; properties: Record<string, number | string> }>;
+        easeEach?: string;
+      }>;
+    };
 
 export interface ElasticHold {
   start: number;
@@ -113,7 +179,7 @@ export interface ElasticHold {
 }
 
 export interface GsapTweenSpec {
-  method: "from" | "to" | "fromTo";
+  method: "from" | "to" | "fromTo" | "set";
   position?: number | string;
   duration?: number;
   ease?: string;
@@ -253,6 +319,8 @@ export interface Composition {
   /** Curried handle — holds only the id, no stale-ref hazard */
   element(id: HfId): ElementHandle;
   getSelection(): string[];
+  /** Replace the current selection; fires selectionchange. Pass [] to clear. */
+  setSelection(ids: string[]): void;
 
   // ── Advanced / agent layer (F10 layer 2) ──────────────────────────────────
   dispatch(op: EditOp, opts?: { origin?: unknown }): void;

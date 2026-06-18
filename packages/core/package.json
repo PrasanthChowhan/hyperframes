@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/core",
-  "version": "0.6.99",
+  "version": "0.6.112",
   "description": "",
   "repository": {
     "type": "git",
@@ -34,7 +34,23 @@
       "import": "./src/compiler/index.ts",
       "types": "./src/compiler/index.ts"
     },
+    "./color-grading": {
+      "import": "./src/colorGrading.ts",
+      "types": "./src/colorGrading.ts"
+    },
+    "./color-luts": {
+      "import": "./src/colorLuts.ts",
+      "types": "./src/colorLuts.ts"
+    },
+    "./storyboard": {
+      "import": "./src/storyboard/index.ts",
+      "types": "./src/storyboard/index.ts"
+    },
     "./runtime": "./dist/hyperframe.runtime.iife.js",
+    "./runtime/clipTree": {
+      "import": "./src/runtime/clipTree.ts",
+      "types": "./src/runtime/clipTree.ts"
+    },
     "./runtime/lottie-readiness": {
       "import": "./src/lottieReadiness.ts",
       "types": "./src/lottieReadiness.ts"
@@ -124,6 +140,14 @@
       "./compiler": {
         "import": "./dist/compiler/index.js",
         "types": "./dist/compiler/index.d.ts"
+      },
+      "./color-grading": {
+        "import": "./dist/colorGrading.js",
+        "types": "./dist/colorGrading.d.ts"
+      },
+      "./color-luts": {
+        "import": "./dist/colorLuts.js",
+        "types": "./dist/colorLuts.d.ts"
       },
       "./runtime": "./dist/hyperframe.runtime.iife.js",
       "./runtime/lottie-readiness": {

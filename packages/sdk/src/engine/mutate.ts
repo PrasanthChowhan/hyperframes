@@ -11,9 +11,11 @@ import type { CanResult, EditOp, GsapTweenSpec, HfId, JsonPatchOp } from "../typ
 import type { ParsedDocument } from "./model.js";
 import {
   resolveScoped,
+  escapeHfId,
   findRoot,
   getElementStyles,
   setElementStyles,
+  toCamel,
   getOwnText,
   setOwnText,
   getSiblingIndex,
@@ -45,12 +47,23 @@ import {
   addAnimationToScript,
   updateAnimationInScript,
   removeAnimationFromScript,
+  removePropertyFromAnimation,
   addKeyframeToScript,
   removeKeyframeFromScript,
+  removeAllKeyframesFromScript,
+  convertToKeyframesFromScript,
+  materializeKeyframesFromScript,
+  splitIntoPropertyGroupsFromScript,
+  splitAnimationsInScript,
   updateKeyframeInScript,
   addLabelToScript,
   removeLabelFromScript,
+  setArcPathInScript,
+  updateArcSegmentInScript,
+  removeArcPathFromScript,
+  unrollDynamicAnimations,
 } from "@hyperframes/core/gsap-writer-acorn";
+import { deriveKeyframeBackfillDefaults } from "./keyframeBackfill.js";
 
 export interface MutationResult {
   forward: JsonPatchOp[];
@@ -133,7 +146,102 @@ function targets(target: HfId | HfId[]): HfId[] {
 
 // ─── Op dispatch ────────────────────────────────────────────────────────────
 
+function dispatchRemoveGsapKeyframe(
+  parsed: ParsedDocument,
+  op: Extract<EditOp, { type: "removeGsapKeyframe" }>,
+): MutationResult {
+  return handleRemoveGsapKeyframeByPercentage(parsed, op.animationId, op.percentage);
+}
+
+function applyGsapKeyframeOp(parsed: ParsedDocument, op: EditOp): MutationResult | undefined {
+  switch (op.type) {
+    case "setGsapKeyframe":
+      return handleSetGsapKeyframe(
+        parsed,
+        op.animationId,
+        op.keyframeIndex,
+        op.position,
+        op.value,
+        op.ease,
+      );
+    case "addGsapKeyframe":
+      return handleAddGsapKeyframe(parsed, op.animationId, op.position, op.value);
+    case "removeGsapKeyframe":
+      return dispatchRemoveGsapKeyframe(parsed, op);
+    case "removeAllKeyframes":
+      return handleRemoveAllKeyframes(parsed, op.animationId);
+    case "convertToKeyframes":
+      return handleConvertToKeyframes(parsed, op.animationId, op.resolvedFromValues);
+    case "materializeKeyframes":
+      return handleMaterializeKeyframes(
+        parsed,
+        op.animationId,
+        op.keyframes,
+        op.easeEach,
+        op.resolvedSelector,
+      );
+    case "splitIntoPropertyGroups":
+      return handleSplitIntoPropertyGroups(parsed, op.animationId);
+    case "splitAnimations":
+      return handleSplitAnimations(parsed, op);
+    default:
+      return undefined;
+  }
+}
+
+function applyArcPathOp(parsed: ParsedDocument, op: EditOp): MutationResult | undefined {
+  const s = getGsapScript(parsed.document) ?? "";
+  switch (op.type) {
+    case "setArcPath": {
+      const cfg = {
+        ...op.config,
+        segments: op.config.segments.map((seg) => ({ ...seg, curviness: seg.curviness ?? 1 })),
+      };
+      return handleArcPathScript(parsed, s, setArcPathInScript(s, op.animationId, cfg));
+    }
+    case "updateArcSegment":
+      return handleArcPathScript(
+        parsed,
+        s,
+        updateArcSegmentInScript(s, op.animationId, op.segmentIndex, op.update),
+      );
+    case "removeArcPath":
+      return handleArcPathScript(parsed, s, removeArcPathFromScript(s, op.animationId));
+    case "unrollDynamicAnimations":
+      return handleArcPathScript(
+        parsed,
+        s,
+        unrollDynamicAnimations(s, op.animationId, op.elements),
+      );
+    default:
+      return undefined;
+  }
+}
+
+function applyGsapOp(parsed: ParsedDocument, op: EditOp): MutationResult | undefined {
+  const kf = applyGsapKeyframeOp(parsed, op);
+  if (kf !== undefined) return kf;
+  const arc = applyArcPathOp(parsed, op);
+  if (arc !== undefined) return arc;
+  switch (op.type) {
+    case "addGsapTween":
+      return handleAddGsapTween(parsed, op.target, op.tween);
+    case "setGsapTween":
+      return handleSetGsapTween(parsed, op.animationId, op.properties);
+    case "removeGsapProperty":
+      return handleRemoveGsapProperty(parsed, op.animationId, op.property, op.from);
+    case "removeGsapTween":
+      return handleRemoveGsapTween(parsed, op.animationId);
+    case "deleteAllForSelector":
+      return handleDeleteAllForSelector(parsed, op.selector);
+    default:
+      return undefined;
+  }
+}
+
 export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
+  const gsap = applyGsapOp(parsed, op);
+  if (gsap !== undefined) return gsap;
   switch (op.type) {
     case "setStyle":
       return handleSetStyle(parsed, targets(op.target), op.styles);
@@ -153,35 +261,20 @@ export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
       return handleMoveElement(parsed, targets(op.target), op.x, op.y);
     case "removeElement":
       return handleRemoveElement(parsed, targets(op.target));
+    case "reorderElements":
+      return handleReorderElements(parsed, op.entries);
     case "setCompositionMetadata":
       return handleSetCompositionMetadata(parsed, op);
     case "setVariableValue":
       return handleSetVariableValue(parsed, op.id, op.value);
-    case "addGsapTween":
-      return handleAddGsapTween(parsed, op.target, op.tween);
-    case "setGsapTween":
-      return handleSetGsapTween(parsed, op.animationId, op.properties);
-    case "removeGsapTween":
-      return handleRemoveGsapTween(parsed, op.animationId);
-    case "setGsapKeyframe":
-      return handleSetGsapKeyframe(
-        parsed,
-        op.animationId,
-        op.keyframeIndex,
-        op.position,
-        op.value,
-        op.ease,
-      );
-    case "addGsapKeyframe":
-      return handleAddGsapKeyframe(parsed, op.animationId, op.position, op.value);
-    case "removeGsapKeyframe":
-      return handleRemoveGsapKeyframe(parsed, op.animationId, op.keyframeIndex);
+    case "setClassStyle":
+      return handleSetClassStyle(parsed, op.selector, op.styles);
     case "addLabel":
       return handleAddLabel(parsed, op.name, op.position);
     case "removeLabel":
       return handleRemoveLabel(parsed, op.name);
-    case "setClassStyle":
-      return handleSetClassStyle(parsed, op.selector, op.styles);
+    default:
+      throw new UnsupportedOpError((op as EditOp).type);
   }
 }
 
@@ -199,8 +292,14 @@ function handleSetStyle(
     const old = getElementStyles(el);
     setElementStyles(el, styles);
     for (const [prop, value] of Object.entries(styles)) {
-      const path = stylePath(id, prop);
-      const oldValue = old[prop] ?? null;
+      // Normalize to the camelCase key the style map + patch grammar use. A
+      // hyphenated op key ("transform-origin") otherwise misses the camelCase
+      // store, so oldValue is always null → undo deletes/loses the prior value,
+      // a removal skips its inverse patch entirely (DOM/patch-log desync), and
+      // the patch path/override-set key diverge from the camelCase grammar.
+      const key = toCamel(prop);
+      const path = stylePath(id, key);
+      const oldValue = old[key] ?? null;
       if (value !== null) {
         const p = scalarChange(path, oldValue, value);
         result.forward.push(p.forward);
@@ -298,11 +397,22 @@ function handleSetTiming(
 
     const oldStartStr = el.getAttribute("data-start");
     const oldEndStr = el.getAttribute("data-end");
+    const oldDurationStr = el.getAttribute("data-duration");
     const oldTrackStr = el.getAttribute("data-track-index");
 
     const oldStart = oldStartStr !== null ? parseFloat(oldStartStr) : null;
     const oldEnd = oldEndStr !== null ? parseFloat(oldEndStr) : null;
-    const oldDuration = oldStart !== null && oldEnd !== null ? oldEnd - oldStart : null;
+    const oldDurationAttr = oldDurationStr !== null ? parseFloat(oldDurationStr) : null;
+    // Prefer an explicit data-duration — the attribute clips are authored with and
+    // the runtime reads — falling back to data-end − data-start. Reading only
+    // data-end left oldDuration null for duration-authored clips, collapsing the
+    // GSAP duration-scale ratio to 1 and scaling nothing.
+    const oldDuration =
+      oldDurationAttr !== null
+        ? oldDurationAttr
+        : oldStart !== null && oldEnd !== null
+          ? oldEnd - oldStart
+          : null;
     const oldTrack = oldTrackStr !== null ? parseInt(oldTrackStr, 10) : null;
 
     const newStart = timing.start ?? oldStart;
@@ -316,7 +426,31 @@ function handleSetTiming(
       el.setAttribute("data-start", String(newStart));
     }
 
-    if (
+    // Write to whichever timing attribute the clip actually uses. A data-duration
+    // clip updates data-duration only on a real resize (duration is invariant
+    // under a move); a data-end clip updates data-end whenever start or duration
+    // changes (end = start + duration). Writing a fresh data-end beside a stale
+    // data-duration had no playback effect.
+    if (oldDurationStr !== null) {
+      if (timing.duration !== undefined && newDuration !== null) {
+        const path = timingPath(id, "duration");
+        const p = scalarChange(path, oldDurationAttr, newDuration);
+        result.forward.push(p.forward);
+        result.inverse.push(p.inverse);
+        el.setAttribute("data-duration", String(newDuration));
+      }
+      // A clip carrying BOTH data-duration and data-end must keep data-end in
+      // sync (end = start + duration) on any start/duration change, else the
+      // stale data-end inverts the clip (end < start) for runtimes that read it.
+      if (oldEndStr !== null && newStart !== null && newDuration !== null) {
+        const newEnd = newStart + newDuration;
+        const endPath = timingPath(id, "end");
+        const ep = scalarChange(endPath, oldEnd, newEnd);
+        result.forward.push(ep.forward);
+        result.inverse.push(ep.inverse);
+        el.setAttribute("data-end", String(newEnd));
+      }
+    } else if (
       (timing.duration !== undefined || timing.start !== undefined) &&
       newStart !== null &&
       newDuration !== null
@@ -343,12 +477,53 @@ function handleSetTiming(
     // Sync GSAP tween positions: the GSAP script is the source of truth at play time —
     // the timeline rebuilds from it on every seek. Without this, DOM attribute edits
     // have zero playback effect; the script's position/duration silently overrides them.
+    // Match against BOTH the element's data-hf-id (the canonical form) AND its DOM
+    // id: the Studio GSAP panel / ensureElementAddressable author tweens as
+    // `#domId`, which selectorMatchesId(hfId) never matched — so moving/resizing
+    // those clips left their tweens unsynced.
+    const matchHfId = el.getAttribute("data-hf-id") ?? id;
+    const matchDomId = el.getAttribute("id");
     if (parsedGsap && currentScript) {
+      // A missing data-start means an implicit start of 0 (matching the server
+      // shiftGsapPositions path); a malformed attr parses to NaN. Sanitize to a
+      // finite number so a start-less/blank clip still shifts and never feeds
+      // NaN into the tween positions.
+      const oldStartNum = oldStart !== null && Number.isFinite(oldStart) ? oldStart : 0;
+      // Per-tween shift/scale (mirrors shiftGsapPositions/scaleGsapPositions): a
+      // multi-tween stagger maps each tween's own intra-clip position by the
+      // start DELTA and scales its duration by the clip-duration RATIO. Writing
+      // the absolute newStart/newDuration onto every tween would collapse the
+      // stagger onto one point and blow each tween's duration to the full clip.
+      const startChanged = timing.start !== undefined && newStart !== null;
+      const durChanged = timing.duration !== undefined && newDuration !== null;
+      const ratio =
+        durChanged && oldDuration !== null && oldDuration > 0 && newDuration !== null
+          ? newDuration / oldDuration
+          : 1;
+      const remapStart = startChanged && newStart !== null ? newStart : oldStartNum;
       for (const { id: animId, animation } of parsedGsap.located) {
-        if (!selectorMatchesId(animation.targetSelector, id)) continue;
+        const matches =
+          selectorMatchesId(animation.targetSelector, matchHfId) ||
+          (matchDomId !== null && selectorMatchesId(animation.targetSelector, matchDomId));
+        if (!matches) continue;
+        // Skip tweens whose position is a label or relative string ("+=0.5",
+        // "<", ">"): relative positions already track their neighbours, and a
+        // string position can't be safely shifted by the clip delta here.
+        // ponytail: known ceiling — string positions are not re-synced on
+        // move/resize; numeric positions only.
+        if (typeof animation.position !== "number") continue;
         const updates: Partial<GsapAnimation> = {};
-        if (timing.start !== undefined && newStart !== null) updates.position = newStart;
-        if (timing.duration !== undefined && newDuration !== null) updates.duration = newDuration;
+        // Don't write an absolute position onto an auto-sequenced tween (no
+        // explicit position arg → parsed as implicitPosition): the writer would
+        // APPEND a position arg, collapsing the stagger onto one point. Duration
+        // still scales below.
+        if ((startChanged || durChanged) && animation.implicitPosition !== true) {
+          const shifted = remapStart + (animation.position - oldStartNum) * ratio;
+          updates.position = Math.max(0, Math.round(shifted * 1000) / 1000);
+        }
+        if (durChanged && typeof animation.duration === "number" && animation.duration > 0) {
+          updates.duration = Math.max(0.001, Math.round(animation.duration * ratio * 1000) / 1000);
+        }
         if (Object.keys(updates).length === 0) continue;
         currentScript = updateAnimationInScript(currentScript, animId, updates);
       }
@@ -432,6 +607,23 @@ function handleRemoveElement(parsed: ParsedDocument, ids: HfId[]): MutationResul
     result.inverse.push(...gsapResult.inverse);
   }
 
+  return result;
+}
+
+function handleReorderElements(
+  parsed: ParsedDocument,
+  entries: Array<{ target: HfId; zIndex: number }>,
+): MutationResult {
+  const result: MutationResult = { forward: [], inverse: [] };
+  // Last write wins per target — a duplicated target collapses to one zIndex
+  // patch instead of emitting redundant same-path patches in one dispatch.
+  const lastByTarget = new Map<HfId, number>();
+  for (const { target, zIndex } of entries) lastByTarget.set(target, zIndex);
+  for (const [target, zIndex] of lastByTarget) {
+    const sub = handleSetStyle(parsed, [target], { zIndex: String(zIndex) });
+    result.forward.push(...sub.forward);
+    result.inverse.push(...sub.inverse);
+  }
   return result;
 }
 
@@ -536,15 +728,20 @@ function collectSubtreeHfIds(el: Element): string[] {
 }
 
 function cascadeRemoveAnimations(script: string, id: HfId): string {
-  const parsedGsap = parseGsapScriptAcornForWrite(script);
-  if (!parsedGsap) return script;
+  // Re-parse after each removal: animation ids are positional, so removing one
+  // tween renumbers the survivors — ids from a single up-front parse go stale and
+  // no-op, orphaning later tweens on the removed element. Same fix as
+  // stripGsapForId in htmlParser.ts (R3 #3); this is its SDK-side twin.
   let current = script;
-  for (const { id: animId, animation } of parsedGsap.located) {
-    if (selectorMatchesId(animation.targetSelector, id)) {
-      current = removeAnimationFromScript(current, animId);
-    }
+  for (;;) {
+    const parsedGsap = parseGsapScriptAcornForWrite(current);
+    if (!parsedGsap) return current;
+    const match = parsedGsap.located.find((l) => selectorMatchesId(l.animation.targetSelector, id));
+    if (!match) return current;
+    const next = removeAnimationFromScript(current, match.id);
+    if (next === current) return current; // guard against a non-removing match
+    current = next;
   }
-  return current;
 }
 
 // ─── setClassStyle handler ────────────────────────────────────────────────────
@@ -579,6 +776,31 @@ function gsapScriptChange(oldScript: string, newScript: string): MutationResult 
 
 // ─── Phase 3b handlers ───────────────────────────────────────────────────────
 
+// Build the GSAP target selector for an add op. The SDK's whole element↔tween
+// attribution is data-hf-id based (selectorMatchesId, cascadeRemoveAnimations,
+// buildAnimationIdMap), so ALWAYS emit the canonical [data-hf-id="…"] form.
+//
+// Resolve the target first: a normal element resolves to itself (hf-id ==
+// target). A sub-composition ROOT addressed by its composition id resolves —
+// via resolveScoped's comp-id fallback — to the host element, whose own
+// data-hf-id we then emit. The fidelity resolver unifies this with the server
+// writer's [data-composition-id="…"] form because both querySelector to the
+// same host node.
+function gsapTargetSelector(
+  document: Parameters<typeof resolveScoped>[0],
+  bareTarget: string,
+): string {
+  const el = resolveScoped(document, bareTarget);
+  if (!el) return `[data-hf-id="${escapeHfId(bareTarget)}"]`;
+  const hfId = el.getAttribute("data-hf-id");
+  if (hfId) return `[data-hf-id="${escapeHfId(hfId)}"]`;
+  // Resolved a sub-comp root that carries data-composition-id but no own
+  // data-hf-id (rare/defensive) — address it by its composition id.
+  const compId = el.getAttribute("data-composition-id");
+  if (compId) return `[data-composition-id="${escapeHfId(compId)}"]`;
+  return `[data-hf-id="${escapeHfId(bareTarget)}"]`;
+}
+
 // fallow-ignore-next-line complexity
 function handleAddGsapTween(
   parsed: ParsedDocument,
@@ -586,23 +808,24 @@ function handleAddGsapTween(
   tween: GsapTweenSpec,
 ): MutationResult {
   const script = getGsapScript(parsed.document);
-  if (!script) return EMPTY;
+  if (!script) throw new Error("No GSAP script block found in the composition.");
 
   const extras: Record<string, unknown> = {};
   if (tween.repeat !== undefined) extras.repeat = tween.repeat;
   if (tween.yoyo !== undefined) extras.yoyo = tween.yoyo;
   if (tween.stagger !== undefined) extras.stagger = tween.stagger;
 
-  const toProps =
-    tween.method === "fromTo"
-      ? ((tween.toProperties ?? {}) as Record<string, number | string>)
-      : ((tween.toProperties ?? tween.properties ?? {}) as Record<string, number | string>);
+  // A fromTo's destination may arrive as either `toProperties` or `properties`
+  // (the Studio add path sets `properties`). Fall back the same way for every
+  // method — the old fromTo-only branch read `toProperties` alone and wrote an
+  // empty to-vars object, so fromTo animations added via cutover animated to {}.
+  const toProps = (tween.toProperties ?? tween.properties ?? {}) as Record<string, number | string>;
 
   // Scoped ids like "hf-host/hf-leaf" must use the bare leaf id in the GSAP
   // selector — only the leaf part is written as data-hf-id on the DOM element.
   const bareTarget = target.includes("/") ? (target.split("/").at(-1) ?? target) : target;
   const animation: Omit<GsapAnimation, "id"> = {
-    targetSelector: `[data-hf-id="${bareTarget}"]`,
+    targetSelector: gsapTargetSelector(parsed.document, bareTarget),
     method: tween.method,
     position: tween.position ?? 0,
     ...(tween.duration !== undefined ? { duration: tween.duration } : {}),
@@ -627,7 +850,7 @@ function handleSetGsapTween(
   properties: Partial<GsapTweenSpec>,
 ): MutationResult {
   const script = getGsapScript(parsed.document);
-  if (!script) return EMPTY;
+  if (!script) throw new Error("No GSAP script block found in the composition.");
 
   const updates: Partial<GsapAnimation> = {};
   if (properties.duration !== undefined) updates.duration = properties.duration;
@@ -651,12 +874,137 @@ function handleSetGsapTween(
   return gsapScriptChange(script, newScript);
 }
 
-function handleRemoveGsapTween(parsed: ParsedDocument, animationId: string): MutationResult {
+function handleRemoveGsapProperty(
+  parsed: ParsedDocument,
+  animationId: string,
+  property: string,
+  from: boolean | undefined,
+): MutationResult {
   const script = getGsapScript(parsed.document);
   if (!script) return EMPTY;
+  const newScript = removePropertyFromAnimation(script, animationId, property, from ?? false);
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleRemoveGsapTween(parsed: ParsedDocument, animationId: string): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) throw new Error("No GSAP script block found in the composition.");
   const newScript = removeAnimationFromScript(script, animationId);
   if (newScript === script) return EMPTY;
   setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleRemoveAllKeyframes(parsed: ParsedDocument, animationId: string): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const newScript = removeAllKeyframesFromScript(script, animationId);
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleConvertToKeyframes(
+  parsed: ParsedDocument,
+  animationId: string,
+  resolvedFromValues?: Record<string, number | string>,
+): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const newScript = convertToKeyframesFromScript(script, animationId, resolvedFromValues);
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleMaterializeKeyframes(
+  parsed: ParsedDocument,
+  animationId: string,
+  keyframes: Array<{
+    percentage: number;
+    properties: Record<string, number | string>;
+    ease?: string;
+  }>,
+  easeEach?: string,
+  resolvedSelector?: string,
+): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const newScript = materializeKeyframesFromScript(
+    script,
+    animationId,
+    keyframes,
+    easeEach,
+    resolvedSelector,
+  );
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleSplitIntoPropertyGroups(
+  parsed: ParsedDocument,
+  animationId: string,
+): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const { script: newScript } = splitIntoPropertyGroupsFromScript(script, animationId);
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleSplitAnimations(
+  parsed: ParsedDocument,
+  op: Extract<EditOp, { type: "splitAnimations" }>,
+): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const { script: newScript } = splitAnimationsInScript(script, {
+    originalId: op.originalId,
+    newId: op.newId,
+    splitTime: op.splitTime,
+    elementStart: op.elementStart,
+    elementDuration: op.elementDuration,
+  });
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(script, newScript);
+}
+
+function handleArcPathScript(
+  parsed: ParsedDocument,
+  oldScript: string,
+  newScript: string,
+): MutationResult {
+  if (newScript === oldScript) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  return gsapScriptChange(oldScript, newScript);
+}
+
+function handleDeleteAllForSelector(parsed: ParsedDocument, selector: string): MutationResult {
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const parsedForWrite = parseGsapScriptAcornForWrite(script);
+  if (!parsedForWrite) return EMPTY;
+  // Compare quote-insensitively: [data-hf-id='x'] and [data-hf-id="x"] are the
+  // same selector. A strict === missed the alternate quote style and matched
+  // nothing while can() reported ok.
+  const wanted = selector.replace(/'/g, '"');
+  const matching = parsedForWrite.located.filter(
+    (l) => l.animation.targetSelector.replace(/'/g, '"') === wanted,
+  );
+  if (matching.length === 0) return EMPTY;
+  let newScript = script;
+  for (const m of [...matching].reverse()) {
+    newScript = removeAnimationFromScript(newScript, m.id);
+  }
+  if (newScript === script) return EMPTY;
+  setGsapScript(parsed.document, newScript);
+  // ponytail: skips stripStudioEditsFromTarget (data-hf-studio-path-offset cleanup) —
+  // studio path offset is cosmetic once all animations are gone; session reloads after write
   return gsapScriptChange(script, newScript);
 }
 
@@ -666,8 +1014,9 @@ function resolveKeyframe(parsed: ParsedDocument, animationId: string, keyframeIn
   const parsedForWrite = parseGsapScriptAcornForWrite(script);
   const located = parsedForWrite?.located.find((l) => l.id === animationId);
   const kfs = located?.animation.keyframes?.keyframes;
-  if (!kfs || keyframeIndex < 0 || keyframeIndex >= kfs.length) return null;
-  return { script, kf: kfs[keyframeIndex]!, kfs };
+  const kf = kfs?.[keyframeIndex];
+  if (!kfs || !kf || keyframeIndex < 0) return null;
+  return { script, kf, kfs };
 }
 
 // fallow-ignore-next-line complexity
@@ -692,7 +1041,17 @@ function handleSetGsapKeyframe(
   let newScript = script;
   if (targetPct !== currentPct) {
     newScript = removeKeyframeFromScript(newScript, animationId, currentPct);
-    newScript = addKeyframeToScript(newScript, animationId, targetPct, props, resolvedEase);
+    // Thread the same backfill defaults the add path uses so a move (remove +
+    // re-add at a new percentage) seeds new props into sibling keyframes the same
+    // way, keeping both entry points behaviorally identical.
+    newScript = addKeyframeToScript(
+      newScript,
+      animationId,
+      targetPct,
+      props,
+      resolvedEase,
+      deriveKeyframeBackfillDefaults(props),
+    );
   } else {
     newScript = updateKeyframeInScript(newScript, animationId, currentPct, props, resolvedEase);
   }
@@ -709,30 +1068,38 @@ function handleAddGsapKeyframe(
   value: Record<string, unknown>,
 ): MutationResult {
   const script = getGsapScript(parsed.document);
-  if (!script) return EMPTY;
+  if (!script) throw new Error("No GSAP script block found in the composition.");
+  const props = value as Record<string, number | string>;
   const newScript = addKeyframeToScript(
     script,
     animationId,
     percentage,
-    value as Record<string, number | string>,
+    props,
+    undefined,
+    deriveKeyframeBackfillDefaults(props),
   );
   if (newScript === script) return EMPTY;
   setGsapScript(parsed.document, newScript);
   return gsapScriptChange(script, newScript);
 }
 
-function handleRemoveGsapKeyframe(
+function handleRemoveGsapKeyframeByPercentage(
   parsed: ParsedDocument,
   animationId: string,
-  keyframeIndex: number,
+  percentage: number,
 ): MutationResult {
-  const resolved = resolveKeyframe(parsed, animationId, keyframeIndex);
-  if (!resolved) return EMPTY;
-  const { script, kf, kfs } = resolved;
-  const pct = kf.percentage;
-  // removeKeyframeFromScript matches by percentage; bail if two keyframes share
-  // the same percentage to avoid removing the wrong one.
-  if (kfs.filter((k) => k.percentage === pct).length > 1) return EMPTY;
+  const script = getGsapScript(parsed.document);
+  if (!script) return EMPTY;
+  const parsedForWrite = parseGsapScriptAcornForWrite(script);
+  const located = parsedForWrite?.located.find((l) => l.id === animationId);
+  const kfs = located?.animation.keyframes?.keyframes;
+  if (!kfs) return EMPTY;
+  // No-op on ambiguity: duplicate-percentage keyframes can't be disambiguated.
+  const TOLERANCE = 0.001;
+  const matches = kfs.filter((k) => Math.abs(k.percentage - percentage) <= TOLERANCE);
+  const sole = matches[0];
+  if (matches.length !== 1 || !sole) return EMPTY;
+  const pct = sole.percentage;
   const newScript = removeKeyframeFromScript(script, animationId, pct);
   if (newScript === script) return EMPTY;
   setGsapScript(parsed.document, newScript);
@@ -765,6 +1132,60 @@ function canErr(code: string, message: string, hint?: string): CanResult {
   return hint ? { ok: false, code, message, hint } : { ok: false, code, message };
 }
 
+/** E_NO_GSAP_SCRIPT CanResult when the composition has no GSAP script, else null. */
+function gsapScriptMissing(parsed: ParsedDocument): CanResult | null {
+  return getGsapScript(parsed.document) === null
+    ? canErr(
+        "E_NO_GSAP_SCRIPT",
+        "No GSAP script block found in the composition.",
+        "This composition does not use GSAP animations.",
+      )
+    : null;
+}
+
+/** The located GSAP animation for `animationId`, or undefined. */
+function locateGsapAnimation(parsed: ParsedDocument, animationId: string) {
+  const script = getGsapScript(parsed.document);
+  if (!script) return undefined;
+  return parseGsapScriptAcornForWrite(script)?.located.find((l) => l.id === animationId);
+}
+
+/**
+ * E_TARGET_NOT_FOUND CanResult when no GSAP animation resolves to `animationId`,
+ * else null. Without this, can() returned ok for stale/positional ids that then
+ * no-op'd at apply — the caller believed the edit would land.
+ */
+function gsapAnimationMissing(parsed: ParsedDocument, animationId: string): CanResult | null {
+  if (getGsapScript(parsed.document) === null) return null; // reported by gsapScriptMissing
+  return locateGsapAnimation(parsed, animationId)
+    ? null
+    : canErr(
+        "E_TARGET_NOT_FOUND",
+        `No GSAP animation found with id "${animationId}".`,
+        "Animation ids are positional and shift after edits — re-read them from comp before dispatching.",
+      );
+}
+
+/** Validate updateArcSegment: the tween must have an enabled arc with that segment. */
+function validateArcSegment(
+  parsed: ParsedDocument,
+  op: Extract<EditOp, { type: "updateArcSegment" }>,
+): CanResult {
+  const arc = locateGsapAnimation(parsed, op.animationId)?.animation.arcPath;
+  if (!arc?.enabled)
+    return canErr(
+      "E_ARC_NOT_ENABLED",
+      `Animation "${op.animationId}" has no enabled arc path.`,
+      "Call setArcPath({ enabled: true }) before updating a segment.",
+    );
+  if (op.segmentIndex < 0 || op.segmentIndex >= arc.segments.length)
+    return canErr(
+      "E_INVALID_ARGS",
+      `Segment index ${op.segmentIndex} is out of range (0..${arc.segments.length - 1}).`,
+    );
+  return CAN_OK;
+}
+
 /** Dry-run validation — returns CanResult for the given op against current document state. */
 // fallow-ignore-next-line complexity
 export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
@@ -779,6 +1200,19 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
       const ids = targets(op.target);
       if (ids.length === 0) return canErr("E_TARGET_NOT_FOUND", "No target ids provided.");
       const missing = ids.filter((id) => resolveScoped(parsed.document, id) === null);
+      if (missing.length > 0)
+        return canErr(
+          "E_TARGET_NOT_FOUND",
+          `Element(s) not found: ${missing.join(", ")}.`,
+          "Verify the id against comp.getElements() or comp.find().",
+        );
+      return CAN_OK;
+    }
+    case "reorderElements": {
+      if (op.entries.length === 0) return CAN_OK;
+      const missing = op.entries
+        .map((e) => e.target)
+        .filter((id) => resolveScoped(parsed.document, id) === null);
       if (missing.length > 0)
         return canErr(
           "E_TARGET_NOT_FOUND",
@@ -822,15 +1256,48 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
     case "setGsapKeyframe":
     case "addGsapKeyframe":
     case "removeGsapKeyframe":
+    case "removeGsapProperty":
     case "removeGsapTween":
+    case "removeAllKeyframes":
+    case "convertToKeyframes":
+    case "splitIntoPropertyGroups":
+    case "setArcPath":
+    case "removeArcPath":
+      return gsapScriptMissing(parsed) ?? gsapAnimationMissing(parsed, op.animationId) ?? CAN_OK;
+    case "updateArcSegment":
+      return (
+        gsapScriptMissing(parsed) ??
+        gsapAnimationMissing(parsed, op.animationId) ??
+        validateArcSegment(parsed, op)
+      );
+    case "splitAnimations":
+    case "deleteAllForSelector":
     case "removeLabel":
-      if (getGsapScript(parsed.document) === null)
-        return canErr(
-          "E_NO_GSAP_SCRIPT",
-          "No GSAP script block found in the composition.",
-          "This composition does not use GSAP animations.",
-        );
-      return CAN_OK;
+      return gsapScriptMissing(parsed) ?? CAN_OK;
+    case "unrollDynamicAnimations":
+      return (
+        gsapScriptMissing(parsed) ??
+        gsapAnimationMissing(parsed, op.animationId) ??
+        (op.elements.length === 0
+          ? canErr(
+              "E_INVALID_ARGS",
+              "unrollDynamicAnimations requires at least one element.",
+              "An empty element list would delete the animation; pass the resolved element list.",
+            )
+          : CAN_OK)
+      );
+    case "materializeKeyframes":
+      return (
+        gsapScriptMissing(parsed) ??
+        gsapAnimationMissing(parsed, op.animationId) ??
+        (op.keyframes.length === 0
+          ? canErr(
+              "E_INVALID_ARGS",
+              "materializeKeyframes requires at least one keyframe.",
+              "An empty keyframe list would empty the animation; pass the resolved keyframes.",
+            )
+          : CAN_OK)
+      );
     default:
       return canErr("E_UNKNOWN_OP", `Unknown op type: "${(op as EditOp).type}".`);
   }

@@ -117,6 +117,14 @@ interface UseAppHotkeysParams {
   onDeleteSelectedKeyframes: () => void;
   onAfterUndoRedo?: () => void;
   onToggleRecording?: () => void;
+  /** Active composition path — used to decide whether undo/redo must resync the SDK session. */
+  activeCompPath?: string | null;
+  /**
+   * Force-reload the SDK session after undo/redo reverts the active comp file,
+   * bypassing the self-write suppress window. Without this, the suppress window
+   * blocks the file-change reload and the SDK session stays on pre-undo content.
+   */
+  forceReloadSdkSession?: () => void;
 }
 
 // ── Extracted keydown dispatch (pure function, no hooks) ──
@@ -136,6 +144,7 @@ interface HotkeyCallbacks {
   onToggleRecording?: () => void;
   leftSidebarRef: React.RefObject<LeftSidebarHandle | null>;
   domEditSelectionRef: React.MutableRefObject<DomEditSelection | null>;
+  showToast: (message: string, tone?: "error" | "info") => void;
 }
 
 function dispatchModifierKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks): boolean {
@@ -203,6 +212,14 @@ function dispatchPlainKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks
       ) {
         event.preventDefault();
         void cb.handleTimelineElementSplit(el, currentTime);
+        return;
+      }
+      // Expanded sub-comp children carry a qualified `sourceFile#id` selection
+      // that isn't in the raw `elements` list, so the s-key can't resolve them.
+      // Nudge toward the razor tool instead of failing silently.
+      if (!el && selectedElementId.includes("#")) {
+        event.preventDefault();
+        cb.showToast("Use the razor tool (B) to split clips inside a sub-composition", "info");
         return;
       }
     }
@@ -293,6 +310,8 @@ export function useAppHotkeys({
   onDeleteSelectedKeyframes,
   onAfterUndoRedo,
   onToggleRecording,
+  activeCompPath,
+  forceReloadSdkSession,
 }: UseAppHotkeysParams) {
   const previewHotkeyWindowRef = useRef<Window | null>(null);
   const previewHistoryCleanupRef = useRef<(() => void) | null>(null);
@@ -340,6 +359,14 @@ export function useAppHotkeys({
       }
       if (result.ok && result.label) {
         onAfterUndoRedo?.();
+        // If the active composition was among the written files, force-reload
+        // the SDK session so its in-memory doc matches the reverted content.
+        // writeHistoryFile sets domEditSaveTimestampRef which activates the
+        // 2 s suppress window — without this call the file-change event would
+        // be swallowed and the SDK session would stay on stale pre-undo content.
+        if (activeCompPath && result.paths?.includes(activeCompPath)) {
+          forceReloadSdkSession?.();
+        }
         await syncHistoryPreviewAfterApply(result.paths);
         showToast(`${direction === "undo" ? "Undid" : "Redid"} ${result.label}`, "info");
       }
@@ -352,6 +379,8 @@ export function useAppHotkeys({
       waitForPendingDomEditSaves,
       writeHistoryFile,
       onAfterUndoRedo,
+      activeCompPath,
+      forceReloadSdkSession,
     ],
   );
 
@@ -376,6 +405,7 @@ export function useAppHotkeys({
     onToggleRecording,
     leftSidebarRef,
     domEditSelectionRef,
+    showToast,
   };
 
   // ── Keydown dispatch ──

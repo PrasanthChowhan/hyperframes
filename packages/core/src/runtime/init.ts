@@ -6,6 +6,11 @@ import { createGsapAdapter } from "./adapters/gsap";
 import { createAnimeJsAdapter } from "./adapters/animejs";
 import { createLottieAdapter } from "./adapters/lottie";
 import { createThreeAdapter } from "./adapters/three";
+import { createMapboxAdapter } from "./adapters/mapbox";
+import { createLeafletAdapter } from "./adapters/leaflet";
+import { createGoogleMapsAdapter } from "./adapters/google-maps";
+import { createMaplibreAdapter } from "./adapters/maplibre";
+import { createD3Adapter } from "./adapters/d3";
 import { createTypegpuAdapter } from "./adapters/typegpu";
 import {
   patchVideoTextureCompat,
@@ -20,11 +25,14 @@ import { createRuntimePlayer } from "./player";
 import { createRuntimeState } from "./state";
 import { collectRuntimeTimelinePayload } from "./timeline";
 import { createRuntimeStartTimeResolver } from "./startResolver";
+import { createClipTree } from "./clipTree";
 import { loadExternalCompositions, loadInlineTemplateCompositions } from "./compositionLoader";
 import { applyCaptionOverrides } from "./captionOverrides";
+import { createColorGradingRuntime, type RuntimeColorGradingApi } from "./colorGrading";
 import { TransportClock } from "./clock";
 import { WebAudioTransport } from "./webAudioTransport";
 import { quantizeTimeToFrame } from "../inline-scripts/parityContract";
+import { STUDIO_MANUAL_EDIT_GESTURE_ATTR } from "../studio-api/helpers/draftMarkers";
 import type { RuntimeDeterministicAdapter, RuntimeJson, RuntimeTimelineLike } from "./types";
 import type { PlayerAPI } from "../core.types";
 import { swallow } from "./diagnostics";
@@ -34,6 +42,7 @@ const AUTHORED_END_ATTR = "data-hf-authored-end";
 
 export function initSandboxRuntimeModular(): void {
   const state = createRuntimeState();
+  let colorGradingRuntime: RuntimeColorGradingApi | null = null;
   let runtimeErrorListener: ((event: ErrorEvent) => void) | null = null;
   let runtimeUnhandledRejectionListener: ((event: PromiseRejectionEvent) => void) | null = null;
   const runtimeCleanupCallbacks: Array<() => void> = [];
@@ -1532,6 +1541,9 @@ export function initSandboxRuntimeModular(): void {
         }
       }
       rawNode.style.visibility = isVisibleNow ? "visible" : "hidden";
+      if (rawNode instanceof HTMLVideoElement || rawNode instanceof HTMLImageElement) {
+        colorGradingRuntime?.setSourceVisibility(rawNode, isVisibleNow);
+      }
     }
   };
 
@@ -1559,6 +1571,18 @@ export function initSandboxRuntimeModular(): void {
     });
   };
 
+  // Signature the live __clipTree was built from; rebuild only when the set of
+  // timed elements changes (e.g. a sub-composition finishes loading), not every
+  // transport tick. A plain count misses same-count swaps (one sub-comp unloads
+  // as another loads), so the signature keys on id+tag in document order.
+  let clipTreeSignature = "";
+  const computeClipTreeSignature = (): string => {
+    let sig = "";
+    for (const el of document.querySelectorAll("[data-start]")) {
+      sig += `${el.id}:${el.tagName}|`;
+    }
+    return sig;
+  };
   const postTimeline = () => {
     sanitizeCompositionDurationAttributes();
     applyCompositionSizing();
@@ -1579,6 +1603,23 @@ export function initSandboxRuntimeModular(): void {
       canonicalFps: state.canonicalFps,
     });
     window.__clipManifest = payload;
+
+    const currentSignature = computeClipTreeSignature();
+    if (!window.__clipTree || clipTreeSignature !== currentSignature) {
+      const runtimeWindow = window as Window & {
+        __timelines?: Record<string, RuntimeTimelineLike | undefined>;
+      };
+      window.__clipTree = createClipTree({
+        startResolver: createRuntimeStartTimeResolver({
+          timelineRegistry: runtimeWindow.__timelines ?? {},
+          includeAuthoredTimingAttrs: true,
+        }),
+        timelineRegistry: runtimeWindow.__timelines ?? {},
+        rootDuration: payload.durationInFrames / state.canonicalFps,
+      });
+      clipTreeSignature = currentSignature;
+    }
+
     postRuntimeMessage(payload);
     scheduleRootStageLayoutDiagnostics();
   };
@@ -1606,6 +1647,65 @@ export function initSandboxRuntimeModular(): void {
 
   let maybePublishRenderReady = () => {
     window.__renderReady = false;
+  };
+  // Internal adapter-readiness tracking. Adapters with outstanding async work
+  // (Three.js `DefaultLoadingManager`, future fetch/font/image detectors) expose
+  // a `getReadyPromise()` method; the runtime waits for whatever they return
+  // before publishing render-ready. This is purely internal — there is no
+  // authored-code-facing flag (LLMs should not need to know about render
+  // readiness, the framework handles async asset gating automatically).
+  let trackedAdapterReadyPromise: PromiseLike<unknown> | null = null;
+  let trackedAdapterReadySettled = true;
+
+  const collectAdapterReadyPromises = (): PromiseLike<unknown>[] => {
+    const promises: PromiseLike<unknown>[] = [];
+    for (const adapter of state.deterministicAdapters) {
+      const getter = adapter.getReadyPromise;
+      if (typeof getter !== "function") continue;
+      try {
+        const p = getter();
+        if (p) promises.push(p);
+      } catch (err) {
+        // A throwing readiness gate must not permanently block render; swallow
+        // and continue, matching the rest of the runtime's adapter-resilience
+        // pattern.
+        swallow("runtime.init.adapterReady", err);
+      }
+    }
+    return promises;
+  };
+
+  const isAdapterReadinessSettled = (): boolean => {
+    const promises = collectAdapterReadyPromises();
+    if (promises.length === 0) {
+      trackedAdapterReadyPromise = null;
+      trackedAdapterReadySettled = true;
+      return true;
+    }
+    // Combine multiple adapter promises so we only attach a single resume
+    // handler. Identity is stable as long as the inputs are stable (each
+    // adapter is expected to return the same promise on repeat calls while
+    // its work is in flight).
+    const combined: PromiseLike<unknown> =
+      promises.length === 1 ? promises[0] : Promise.all(promises);
+    if (combined !== trackedAdapterReadyPromise) {
+      trackedAdapterReadyPromise = combined;
+      trackedAdapterReadySettled = false;
+      void Promise.resolve(combined).then(
+        () => {
+          if (trackedAdapterReadyPromise !== combined) return;
+          trackedAdapterReadySettled = true;
+          maybePublishRenderReady();
+        },
+        (err) => {
+          if (trackedAdapterReadyPromise !== combined) return;
+          trackedAdapterReadySettled = true;
+          swallow("runtime.init.adapterReady", err);
+          maybePublishRenderReady();
+        },
+      );
+    }
+    return trackedAdapterReadySettled;
   };
 
   if (!externalCompositionsReady) {
@@ -1646,6 +1746,13 @@ export function initSandboxRuntimeModular(): void {
     postMessage: (payload) => postRuntimeMessage(payload),
   });
   picker.installPickerApi();
+
+  const colorGrading = createColorGradingRuntime();
+  colorGradingRuntime = colorGrading;
+  registerRuntimeCleanup(() => {
+    colorGrading.destroy();
+    colorGradingRuntime = null;
+  });
 
   const applyPlaybackRate = (nextRate: number) => {
     const parsed = Number(nextRate);
@@ -1704,7 +1811,9 @@ export function initSandboxRuntimeModular(): void {
     },
     onDeterministicPause: () => runAdapters("pause"),
     onDeterministicPlay: () => runAdapters("play"),
-    onRenderFrameSeek: () => {},
+    onRenderFrameSeek: () => {
+      colorGrading.redraw();
+    },
     onShowNativeVideos: () => {},
     getSafeDuration: () => getSafeTimelineDurationSeconds(state.capturedTimeline, 0),
   });
@@ -1770,6 +1879,12 @@ export function initSandboxRuntimeModular(): void {
       if (state.transportClock) state.transportClock.setRate(state.playbackRate);
       applyWebAudioRate();
     },
+    onSetColorGrading: (target, grading) => {
+      colorGrading.setGrading(target, grading);
+    },
+    onSetColorGradingCompare: (target, compare) => {
+      colorGrading.setCompare(target, compare);
+    },
     onTick: () => {
       if (state.tornDown || !clock.isPlaying()) return;
       const t = clock.now();
@@ -1803,6 +1918,11 @@ export function initSandboxRuntimeModular(): void {
     createAnimeJsAdapter(),
     createLottieAdapter(),
     createThreeAdapter(),
+    createMapboxAdapter(),
+    createLeafletAdapter(),
+    createGoogleMapsAdapter(),
+    createMaplibreAdapter(),
+    createD3Adapter(),
     createTypegpuAdapter(),
     createGsapAdapter({ getTimeline: () => state.capturedTimeline }),
   ] as RuntimeDeterministicAdapter[];
@@ -1856,6 +1976,16 @@ export function initSandboxRuntimeModular(): void {
 
   maybePublishRenderReady = () => {
     if (!externalCompositionsReady || window.__hfTimelinesBuilding) {
+      window.__renderReady = false;
+      return;
+    }
+    // Re-run discover so adapters can refresh their state from the current
+    // DOM — e.g. the Three.js adapter only hooks `DefaultLoadingManager` once
+    // it sees `window.THREE`, which may have loaded AFTER the initial
+    // bootstrap discover. Discover is idempotent in every adapter, so a
+    // second call here is cheap.
+    runAdapters("discover", state.currentTime);
+    if (!isAdapterReadinessSettled()) {
       window.__renderReady = false;
       return;
     }
@@ -1994,6 +2124,24 @@ export function initSandboxRuntimeModular(): void {
     }
   };
 
+  // True while the Studio is mid-drag on an element (the gesture marker is
+  // stamped on the gestured element for the duration of the drag). During a
+  // paused gesture the draft writer owns the element's transform, so the
+  // per-frame transport re-seek must yield to it (see transportTick).
+  //
+  // The query is document-global (fine for today's single-composition Studio;
+  // revisit if a multi-composition editor needs to scope this to one root).
+  // It only runs while the clock is paused — transportTick short-circuits on
+  // isPlaying() — so it is off the playback hot path; one attribute selector
+  // per paused frame is negligible.
+  const hasActiveStudioManualEditGesture = (): boolean => {
+    try {
+      return document.querySelector(`[${STUDIO_MANUAL_EDIT_GESTURE_ATTR}]`) != null;
+    } catch {
+      return false;
+    }
+  };
+
   const transportTick = () => {
     if (state.tornDown || inTransportTick) return;
     inTransportTick = true;
@@ -2084,7 +2232,17 @@ export function initSandboxRuntimeModular(): void {
 
       const t = clock.now();
       state.currentTime = t;
-      seekTimelineAndAdapters(t);
+      // During a paused Studio manual-edit drag, the draft writer owns the
+      // gestured element's transform (e.g. gsap.set for x/y). Re-seeking the
+      // timeline every frame re-applies the animated value and clobbers the
+      // draft, freezing the element while only the selection box tracks the
+      // cursor. The playhead does not advance during a paused gesture, so
+      // skipping the re-seek is a no-op for every other element; it resumes
+      // the frame the gesture marker clears (drop/cancel). Playback is never
+      // affected — the seek runs whenever the clock is playing.
+      if (clock.isPlaying() || !hasActiveStudioManualEditGesture()) {
+        seekTimelineAndAdapters(t);
+      }
 
       // Looping is handled at the player layer (<hyperframes-player>),
       // not the runtime. The clock pauses at duration; GSAP's repeat:-1
@@ -2229,6 +2387,7 @@ export function initSandboxRuntimeModular(): void {
     if (webAudioReady) scheduleWebAudioForActiveClips();
     runAdapters("play");
     syncMediaForCurrentState();
+    colorGrading.redraw();
     postState(true);
   };
 
@@ -2245,6 +2404,7 @@ export function initSandboxRuntimeModular(): void {
     if (tl) tl.pause();
     runAdapters("pause");
     syncMediaForCurrentState();
+    colorGrading.redraw();
     postState(true);
   };
 
@@ -2266,6 +2426,7 @@ export function initSandboxRuntimeModular(): void {
     seekTimelineAndAdapters(state.currentTime);
     runAdapters("pause");
     syncMediaForCurrentState();
+    colorGrading.redraw();
     postState(true);
   };
 
@@ -2281,6 +2442,7 @@ export function initSandboxRuntimeModular(): void {
     state.mediaForceSyncNextTick = true;
     seekTimelineAndAdapters(state.currentTime, { activateChildren: true });
     syncMediaForCurrentState();
+    colorGrading.redraw();
     postState(true);
   };
 

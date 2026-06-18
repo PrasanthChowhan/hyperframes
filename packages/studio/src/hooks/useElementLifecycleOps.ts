@@ -26,11 +26,19 @@ interface UseElementLifecycleOpsParams {
   projectIdRef: React.MutableRefObject<string | null>;
   reloadPreview: () => void;
   clearDomSelection: () => void;
+  /** Route delete through SDK when session resolves the hf-id; returns true if handled. */
+  onTrySdkDelete?: (hfId: string, originalContent: string, targetPath: string) => Promise<boolean>;
+  /** Resolver-shadow tripwire for the reordered targets (telemetry-only, decoupled from cutover). */
+  onReorderShadow?: (targets: string[]) => void;
+  /** Resync the SDK session after a server-fallback delete. */
+  forceReloadSdkSession?: () => void;
   commitPositionPatchToHtml: (
     selection: DomEditSelection,
     patches: PatchOperation[],
     options: { label: string; coalesceKey: string; skipRefresh?: boolean },
   ) => Promise<void>;
+  /** Stage 7 Step 3b: called after a successful server-side element delete (shadow). */
+  onElementDeleted?: (selection: DomEditSelection) => void;
 }
 
 export function useElementLifecycleOps({
@@ -42,7 +50,11 @@ export function useElementLifecycleOps({
   projectIdRef,
   reloadPreview,
   clearDomSelection,
+  onTrySdkDelete,
+  onReorderShadow,
+  forceReloadSdkSession,
   commitPositionPatchToHtml,
+  onElementDeleted,
 }: UseElementLifecycleOpsParams) {
   // fallow-ignore-next-line complexity
   const handleDomEditElementDelete = useCallback(
@@ -71,6 +83,16 @@ export function useElementLifecycleOps({
           throw new Error("Selected element has no patchable target");
         }
 
+        if (onTrySdkDelete && selection.hfId) {
+          const handled = await onTrySdkDelete(selection.hfId, originalContent, targetPath);
+          if (handled) {
+            clearDomSelection();
+            usePlayerStore.getState().setSelectedElementId(null);
+            showToast(`Deleted ${label}. Use Undo to restore it.`, "info");
+            return;
+          }
+        }
+
         domEditSaveTimestampRef.current = Date.now();
         const removeResponse = await fetch(
           `/api/projects/${pid}/file-mutations/remove-element/${encodeURIComponent(targetPath)}`,
@@ -90,6 +112,12 @@ export function useElementLifecycleOps({
         const removeData = (await removeResponse.json()) as { changed?: boolean; content?: string };
         const patchedContent =
           typeof removeData.content === "string" ? removeData.content : originalContent;
+        // ponytail: the server remove-element route (removeElementFromHtml) strips
+        // only the element node — it does NOT cascade-remove GSAP tweens targeting
+        // it, unlike the SDK path (removeElement → cascadeRemoveAnimations). This
+        // fallback runs only when the element isn't in the SDK doc (e.g. runtime-
+        // generated / unaddressable), where targeting tweens are unlikely. Upgrade
+        // path: cascade in removeElementFromHtml by selector/hf-id to fully match.
         await saveProjectFilesWithHistory({
           projectId: pid,
           label: "Delete element",
@@ -102,7 +130,11 @@ export function useElementLifecycleOps({
 
         clearDomSelection();
         usePlayerStore.getState().setSelectedElementId(null);
+        // Server wrote the file; resync the stale in-memory SDK doc so a later
+        // SDK edit doesn't resurrect the deleted element.
+        forceReloadSdkSession?.();
         reloadPreview();
+        onElementDeleted?.(selection);
         showToast(`Deleted ${label}. Use Undo to restore it.`, "info");
       } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to delete element";
@@ -114,6 +146,9 @@ export function useElementLifecycleOps({
       clearDomSelection,
       domEditSaveTimestampRef,
       editHistory.recordEdit,
+      onTrySdkDelete,
+      onElementDeleted,
+      forceReloadSdkSession,
       projectIdRef,
       reloadPreview,
       showToast,
@@ -121,6 +156,9 @@ export function useElementLifecycleOps({
     ],
   );
 
+  // ponytail: z-index reorder writes inline-style patches via commitPositionPatchToHtml →
+  // persistDomEditOperations → onTrySdkPersist, so it is already SDK-cut-over as setStyle.
+  // No SDK reorder/reparent op exists; DOM sibling order stays server-authoritative if ever needed.
   const handleDomZIndexReorderCommit = useCallback(
     (
       entries: Array<{
@@ -133,6 +171,11 @@ export function useElementLifecycleOps({
       }>,
     ) => {
       if (entries.length === 0) return;
+      // Resolver shadow (telemetry-only, decoupled from cutover): record whether
+      // the SDK resolves each reordered element — the reorderElements op's targets.
+      onReorderShadow?.(
+        entries.map((e) => readHfId(e.element)).filter((id): id is string => id != null),
+      );
       const coalesceKey = `z-reorder:${entries.map((e) => e.id ?? e.selector ?? e.element.getAttribute("data-hf-id") ?? "el").join(":")}`;
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
@@ -167,7 +210,7 @@ export function useElementLifecycleOps({
         ).catch(() => undefined);
       }
     },
-    [commitPositionPatchToHtml],
+    [commitPositionPatchToHtml, onReorderShadow],
   );
 
   return {
