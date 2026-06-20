@@ -568,6 +568,10 @@ export function StudioApp() {
                         onToggleRecording={
                           STUDIO_KEYFRAMES_ENABLED ? handleToggleRecording : undefined
                         }
+                        sdkSession={sdkHandle.session}
+                        reloadPreview={reloadPreview}
+                        domEditSaveTimestampRef={domEditSaveTimestampRef}
+                        recordEdit={editHistory.recordEdit}
                       />
                     )}
                   </div>
