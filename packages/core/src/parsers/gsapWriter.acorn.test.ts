@@ -14,6 +14,7 @@ import {
   updateAnimationInScript,
   updateKeyframeInScript,
 } from "./gsapWriterAcorn.js";
+import { parseGsapScript } from "./gsapParser.js";
 
 // ---------------------------------------------------------------------------
 // Fixture scripts
@@ -248,6 +249,62 @@ describe("T6c — keyframe write ops", () => {
     // Duration and position are unchanged
     expect(result).toContain("duration: 0.5");
     expect(result).toContain("}, 0.2)");
+  });
+
+  it("updateKeyframeInScript edits ARRAY-form keyframes by percentage→index (the #shuttle case)", () => {
+    // Array-form keyframes carry no explicit percentages; GSAP distributes 4 of
+    // them evenly → 0 / 33.3 / 66.7 / 100. Dragging the 2nd motion-path node
+    // (pct 33.3) must rewrite array index 1 — not no-op (regression: array form
+    // bailed the ObjectExpression check, so the drag committed nothing).
+    const script =
+      "const tl = gsap.timeline();\n" +
+      'tl.to("#shuttle", { keyframes: [{ x: 0, y: 0 }, { x: 520, y: 120 }, { x: 1040, y: 0 }, { x: 1480, y: 160 }], duration: 4.4, ease: "none" }, 5.2);';
+    const result = updateKeyframeInScript(script, "#shuttle-to-5200-position", 33.3, {
+      x: 503,
+      y: 642,
+    });
+    expect(result).not.toBe(script); // actually changed (not a no-op)
+    expect(result).toContain("x: 503");
+    expect(result).toContain("y: 642");
+    expect(result).not.toContain("x: 520"); // index 1 replaced
+    // Sibling array entries untouched.
+    expect(result).toContain("{ x: 0, y: 0 }");
+    expect(result).toContain("{ x: 1040, y: 0 }");
+    expect(result).toContain("{ x: 1480, y: 160 }");
+  });
+
+  it("updateAnimationInScript apply-to-all sets easeEach and strips per-keyframe eases", () => {
+    const script =
+      "const tl = gsap.timeline();\n" +
+      'tl.to("#box", { keyframes: { "0%": { x: 0 }, "50%": { x: 50, ease: "power2.in" }, "100%": { x: 100, ease: "back.out" }, easeEach: "none" }, duration: 1 }, 0);';
+    const id = parseGsapScript(script).animations[0]!.id;
+    const result = updateAnimationInScript(script, id, {
+      easeEach: "power2.out",
+      resetKeyframeEases: true,
+    });
+    // easeEach updated to the chosen ease …
+    expect(result).toContain('easeEach: "power2.out"');
+    // … and every per-keyframe override is gone, so all segments use easeEach.
+    expect(result).not.toContain('ease: "power2.in"');
+    expect(result).not.toContain('ease: "back.out"');
+    // keyframe property values are preserved.
+    const kf = parseGsapScript(result).animations[0]!.keyframes!;
+    expect(kf.easeEach).toBe("power2.out");
+    expect(kf.keyframes.every((k) => k.ease === undefined)).toBe(true);
+    expect(kf.keyframes.map((k) => k.properties.x)).toEqual([0, 50, 100]);
+  });
+
+  it("addKeyframeToScript — ARRAY-form normalizes to object form + inserts 50%", () => {
+    const script =
+      "const tl = gsap.timeline();\n" +
+      'tl.to("#shuttle", { keyframes: [{ x: 0, y: 0 }, { x: 520, y: 120 }, { x: 1040, y: 0 }, { x: 1480, y: 160 }], duration: 4.4, ease: "none" }, 5.2);';
+    const result = addKeyframeToScript(script, "#shuttle-to-5200-position", 50, { x: 780, y: 60 });
+    expect(result).not.toBe(script); // not a no-op
+    expect(result).toContain('"50%"'); // converted to percentage-object form
+    expect(result).toContain("x: 780");
+    // Original even-distribution stops preserved as percentage keys.
+    expect(result).toContain('"0%"');
+    expect(result).toContain('"100%"');
   });
 
   it("addKeyframeToScript inserts new percentage in sorted order", () => {

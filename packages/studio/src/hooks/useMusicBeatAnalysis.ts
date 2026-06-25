@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { usePlayerStore } from "../player/store/playerStore";
 import { isMusicTrack } from "../utils/timelineInspector";
 import { analyzeMusicFromUrl } from "@hyperframes/core/beats";
-import { useFileManagerContext } from "../contexts/FileManagerContext";
+import { useFileManagerContextOptional } from "../contexts/FileManagerContext";
 import { mergeUserBeats } from "../utils/beatEditing";
 import {
   audioRelPathForSrc,
@@ -58,11 +58,18 @@ export function useMusicBeatAnalysis(): void {
   const setBeatEdits = usePlayerStore((s) => s.setBeatEdits);
   const setBeatPersist = usePlayerStore((s) => s.setBeatPersist);
   const resetBeatHistory = usePlayerStore((s) => s.resetBeatHistory);
-  const { readOptionalProjectFile, writeProjectFile } = useFileManagerContext();
+  const fileManager = useFileManagerContextOptional();
+  const readOptionalProjectFile = fileManager?.readOptionalProjectFile;
+  const writeProjectFile = fileManager?.writeProjectFile;
 
   // File IO via ref so the effects only re-run when the track changes.
-  const ioRef = useRef({ readOptionalProjectFile, writeProjectFile });
-  ioRef.current = { readOptionalProjectFile, writeProjectFile };
+  const ioRef = useRef<
+    (ProjectIo & { writeProjectFile: (p: string, c: string) => Promise<void> }) | null
+  >(null);
+  ioRef.current =
+    readOptionalProjectFile && writeProjectFile
+      ? { readOptionalProjectFile, writeProjectFile }
+      : null;
 
   const musicSrc = useMemo(() => {
     const el = elements.find((e) => isMusicTrack(e));
@@ -78,32 +85,55 @@ export function useMusicBeatAnalysis(): void {
       resetBeatHistory();
       return;
     }
-    let cancelled = false;
-
-    let promise = analysisCache.get(musicSrc);
-    if (!promise) {
-      promise = analyzeMusicFromUrl(musicSrc);
-      cacheAnalysis(musicSrc, promise);
+    if (!ioRef.current) {
+      setBeatAnalysis(null);
+      setBeatEdits(null);
+      resetBeatHistory();
+      return;
     }
-
+    let cancelled = false;
     const beatPath = beatFilePathForSrc(musicSrc);
-    promise
-      .then(async (analysis) => {
+    const io = ioRef.current;
+
+    // Only run expensive audio decode + beat analysis when the user has an
+    // explicit beats file saved. Without one, skip entirely — no surprise
+    // green lines on the timeline after dragging unrelated assets.
+    (async () => {
+      if (!beatPath || !io) return;
+      let hasSavedBeats = false;
+      try {
+        const content = await io.readOptionalProjectFile(beatPath);
+        const parsed = content ? parseBeats(content) : null;
+        hasSavedBeats = !!(parsed && parsed.times.length > 0);
+      } catch {
+        /* no file */
+      }
+      if (cancelled) return;
+      if (!hasSavedBeats) {
+        setBeatAnalysis(null);
+        return;
+      }
+
+      let promise = analysisCache.get(musicSrc);
+      if (!promise) {
+        promise = analyzeMusicFromUrl(musicSrc);
+        cacheAnalysis(musicSrc, promise);
+      }
+      try {
+        const analysis = await promise;
         const detected = { times: analysis.beatTimes, strengths: analysis.beatStrengths };
-        const { times, strengths, hasFile } = await resolveBeats(beatPath, detected, ioRef.current);
+        const { times, strengths } = await resolveBeats(beatPath, detected, io);
         if (cancelled) return;
         setBeatEdits(null);
         resetBeatHistory();
         setBeatAnalysis({ ...analysis, beatTimes: times, beatStrengths: strengths });
-        // Seed a missing file through the SAME debounced writer the edits use, so
-        // the initial write can't race a near-simultaneous edit's persist.
-        if (beatPath && !hasFile && times.length > 0) usePlayerStore.getState().beatPersist?.();
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setBeatAnalysis(null);
-        analysisCache.delete(musicSrc);
-      });
+      } catch {
+        if (!cancelled) {
+          setBeatAnalysis(null);
+          analysisCache.delete(musicSrc);
+        }
+      }
+    })();
 
     return () => {
       cancelled = true;
@@ -114,10 +144,11 @@ export function useMusicBeatAnalysis(): void {
   //    Flushes any pending write on cleanup so the last edit is never lost. ──
   useEffect(() => {
     const beatPath = beatFilePathForSrc(musicSrc);
-    if (!musicSrc || !beatPath) {
+    if (!musicSrc || !beatPath || !ioRef.current) {
       setBeatPersist(null);
       return;
     }
+    const io = ioRef.current;
     const audio = audioRelPathForSrc(musicSrc) ?? "audio";
     let timer: ReturnType<typeof setTimeout> | null = null;
     let pending: string | null = null;
@@ -126,7 +157,7 @@ export function useMusicBeatAnalysis(): void {
       if (pending === null) return;
       const content = pending;
       pending = null;
-      void ioRef.current.writeProjectFile(beatPath, content).catch(() => {});
+      void io.writeProjectFile(beatPath, content).catch(() => {});
     };
 
     const persist = () => {
