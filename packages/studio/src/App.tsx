@@ -588,7 +588,11 @@ export function StudioApp() {
                     appToast={appToast}
                     dismissToast={dismissToast}
                   />
-                  <GlobalCatalogActionsManager handleAddBlock={handleAddBlock} />
+                  <GlobalCatalogActionsManager
+                    handleAddBlock={handleAddBlock}
+                    activeCompPath={activeCompPath}
+                    compositionDimensions={compositionDimensions}
+                  />
                 </div>
               </DomEditProvider>
             </FileManagerProvider>
